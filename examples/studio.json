@@ -1,0 +1,17 @@
+{
+  "camera": {
+    "transform": [1,0,0,0,0,1,0,0,0,0,1,0,0,1.5,5,1],
+    "focal_length": 50, "horizontal_aperture": 36, "vertical_aperture": 20.25,
+    "near": 0.01, "far": 1000
+  },
+  "meshes": [
+    {"points":[[-5,0,-5],[-5,0,5],[5,0,5],[5,0,-5]],"face_counts":[4],"indices":[0,1,2,3],"color":[0.65,0.65,0.65]},
+    {"points":[[-0.8,0,0],[0.8,0,0],[0,2,0]],"face_counts":[3],"indices":[0,1,2],"color":[0.75,0.12,0.05]}
+  ],
+  "lights": [
+    {"type":"area","position":[-2,4,2],"u":[2,0,0],"v":[0,0,2],"color":[1,0.88,0.72],"intensity":30},
+    {"type":"directional","direction":[-1,-1,-1],"color":[0.55,0.7,1],"intensity":0.4},
+    {"type":"point","position":[3,2,1],"color":[1,1,1],"intensity":4},
+    {"type":"spot","position":[0,4,0],"direction":[0,-1,0],"color":[1,1,1],"intensity":5,"cone_degrees":35,"softness":0.3}
+  ]
+}

@@ -1,0 +1,5 @@
+-- glslfx version 0.1
+-- configuration
+{"techniques":{"default":{"surfaceShader":{"source":["Lava.Surface"]}}}}
+-- glsl Lava.Surface
+// Registry marker only. The Vulkan Material subsystem supplies the BSDF product.

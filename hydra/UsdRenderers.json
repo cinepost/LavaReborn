@@ -1,0 +1,15 @@
+{
+  "LavaRendererPlugin": {
+    "valid": true,
+    "menulabel": "Lava Reborn (Prototype)",
+    "menupriority": 10,
+    "allowbackgroundupdate": true,
+    "defaultpurposes": [
+      "render"
+    ],
+    "aovsupport": true,
+    "needsdepth": false,
+    "needsselection": false,
+    "depthstyle": "linear"
+  }
+}

@@ -1,0 +1,223 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "light_bvh.glsl"
+#include "camera.glsl"
+#include "queue.glsl"
+#include "materials/visibility.glsl"
+#include "materials/surface.glsl"
+layout(local_size_x=64) in;
+float powerWeight(float a,float b) {if(a<=0.)return 0.;float r=b/a;return 1./(1.+r*r);}
+vec3 environment() {return vec3(.015,.02,.03);}
+float epsilonAt(vec3 p) {return max(1e-4,1e-6*max(abs(p.x),max(abs(p.y),abs(p.z))));}
+bool visible(vec3 origin,vec3 direction,float distance,uint sampledLight) {
+  rayQueryEXT q;
+  rayQueryInitializeEXT(q,world,gl_RayFlagsTerminateOnFirstHitEXT,255,origin,1e-5,direction,distance);
+  while(rayQueryProceedEXT(q)){
+   if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT) {
+    uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+    if(materialCovered(candidate,rayQueryGetWorldRayOriginEXT(q),rayQueryGetWorldRayDirectionEXT(q)))rayQueryConfirmIntersectionEXT(q);
+   }
+  }
+  if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT)return false;
+  uint emitter;return !traceLights(origin,direction,1e-5,distance,emitter,sampledLight);
+}
+// Offset the origin first, then construct the finite segment to the sampled
+// point. Reusing the unoffset direction/distance makes an analytic rectangle
+// intersect its own shadow ray at grazing angles (and creates spatial bands).
+bool lightVisible(vec3 p,vec3 n,vec3 wi,vec3 target,uint kind,uint sampledLight) {
+  float e=epsilonAt(p);
+  vec3 origin=p+n*(dot(n,wi)>=0.?e:-e);
+  if(kind==3u)return visible(origin,wi,1e30,sampledLight);
+  vec3 delta=target-origin;float distance=length(delta);
+  float endpointBias=epsilonAt(target);
+  if(distance<=endpointBias+1e-5)return true;
+  return visible(origin,delta/distance,distance-endpointBias,sampledLight);
+}
+vec3 nextEvent(vec3 p,vec3 n,vec3 ng,vec3 albedo,float kd,inout uint seed) {
+  if(pc.lightCount==0u||kd<=0.)return vec3(0);
+  float selection;uint id=chooseLight(p,seed,selection);Light l=lights[id];
+  uint kind=uint(l.position_kind.w);
+  vec3 target=l.position_kind.xyz;
+  if(kind==2u)target+=(pathSample(seed)-.5)*l.u_soft.xyz+(pathSample(seed)-.5)*l.v.xyz;
+  vec3 delta=target-p;float distance=length(delta);
+  vec3 wi=kind==3u?-normalize(l.direction_cone.xyz):delta/max(distance,1e-12);
+  if(dot(ng,wi)<=0.)return vec3(0);
+  float cosine=max(0.,dot(n,wi));if(cosine==0.)return vec3(0);
+  float pdf=selection,weight=1.;vec3 incident=emission(id);
+  if(kind==2u) {
+    vec3 crossUV=cross(l.u_soft.xyz,l.v.xyz);float area=length(crossUV);
+    float cosLight=emitterCosine(l,crossUV/max(area,1e-20),wi);
+    if(cosLight<=0.)return vec3(0);
+    pdf*=distance*distance/(area*cosLight);
+    weight=powerWeight(pdf,kd*cosine/PI);
+  } else if(kind!=3u)incident/=max(distance*distance,1e-12);
+  if(kind==1u) {
+    float outer=cos(radians(l.direction_cone.w));
+    float inner=cos(radians(l.direction_cone.w*(1.-l.u_soft.w)));
+    float cone=dot(-wi,normalize(l.direction_cone.xyz));
+    incident*=inner>outer+1e-6?smoothstep(outer,inner,cone):step(outer,cone);
+  }
+  if(!lightVisible(p,ng,wi,target,kind,id))return vec3(0);
+  return kd*albedo/PI*incident*cosine*weight/max(pdf,1e-30);
+}
+float fresnelDielectric(float c,float eta) {
+  float sinT2=eta*eta*max(0.,1.-c*c);if(sinT2>=1.)return 1.;
+  float ct=sqrt(1.-sinT2);
+  float rs=(eta*c-ct)/(eta*c+ct),rp=(c-eta*ct)/(c+eta*ct);
+  return .5*(rs*rs+rp*rp);
+}
+bool scatterLegacy(inout PathRay ray,uint primitive,vec2 bary) {
+  Triangle t=triangles[primitive];
+  vec3 p=t.a.xyz*(1.-bary.x-bary.y)+t.b.xyz*bary.x+t.c.xyz*bary.y;
+  vec3 ng=geometricNormal(t),ns=shadingNormal(t,bary,-ray.directionDelta.xyz);
+  bool entering=dot(ng,ray.directionDelta.xyz)<0.;vec3 n=entering?ns:-ns;
+  vec3 albedo=clamp(t.color.rgb,vec3(0),vec3(1));
+  float metal=t.material.x,glass=(1.-metal)*t.material.y,kd=(1.-metal)*(1.-t.material.y);
+  uvec3 depth=uvec3(ray.state.z&255u,(ray.state.z>>8)&255u,(ray.state.z>>16)&255u);
+  radiance[ray.state.x].rgb+=ray.throughput.rgb*nextEvent(p,n,entering?ng:-ng,albedo,depth.x<pc.diffuseDepth?kd:0.,ray.state.y);
+  float choose=pathSample(ray.state.y);vec3 direction;float pdf=0.;bool delta=true;bool transmitted=false;
+  if(choose<kd) {
+    if(depth.x>=pc.diffuseDepth)return false;
+    depth.x++;
+    float r=sqrt(pathSample(ray.state.y)),phi=2.*PI*pathSample(ray.state.y);
+    vec3 tangent=normalize(cross(abs(n.z)<.999?vec3(0,0,1):vec3(0,1,0),n));
+    direction=normalize(tangent*(r*cos(phi))+cross(n,tangent)*(r*sin(phi))+n*sqrt(max(0.,1.-r*r)));
+    pdf=kd*max(0.,dot(n,direction))/PI;delta=false;ray.throughput.rgb*=albedo;
+  } else if(choose<kd+metal) {
+    if(depth.y>=pc.reflectionDepth)return false;
+    depth.y++;direction=reflect(ray.directionDelta.xyz,n);ray.throughput.rgb*=albedo;
+  } else {
+    if(glass<=0.)return false;
+    float eta=entering?1./t.material.z:t.material.z;
+    float f=fresnelDielectric(clamp(-dot(n,ray.directionDelta.xyz),0.,1.),eta);
+    if(pathSample(ray.state.y)<f) {
+      if(depth.y>=pc.reflectionDepth)return false;
+      depth.y++;direction=reflect(ray.directionDelta.xyz,n);
+    } else {
+      if(depth.z>=pc.refractionDepth)return false;
+      depth.z++;direction=refract(ray.directionDelta.xyz,n,eta);transmitted=true;
+      ray.throughput.rgb*=albedo*eta*eta;
+    }
+  }
+  if((dot(ng,direction)*dot(ng,-ray.directionDelta.xyz)<0.)!=transmitted)return false;
+  if(any(isnan(ray.throughput.rgb))||any(isinf(ray.throughput.rgb)))return false;
+  float throughput=max(ray.throughput.r,max(ray.throughput.g,ray.throughput.b));
+  if(throughput<=0.)return false;
+  if(depth.x+depth.y+depth.z>=pc.rouletteStart) {
+    float survival=clamp(throughput,.05,.95);
+    if(pathSample(ray.state.y)>=survival)return false;
+    ray.throughput.rgb/=survival;
+  }
+  ray.originPdf=vec4(p+ng*(dot(ng,direction)>0.?1.:-1.)*epsilonAt(p),pdf);
+  ray.directionDelta=vec4(normalize(direction),delta?1.:0.);
+  ray.state.z=depth.x|(depth.y<<8)|(depth.z<<16);
+  return true;
+}
+vec3 surfaceNextEvent(vec3 p,vec3 n,MaterialSurface surface,inout uint seed) {
+  if(pc.lightCount==0u)return vec3(0);
+  float selection;uint id=chooseLight(p,seed,selection);Light l=lights[id];
+  uint kind=uint(l.position_kind.w);
+  vec3 target=l.position_kind.xyz;
+  if(kind==2u)target+=(pathSample(seed)-.5)*l.u_soft.xyz+(pathSample(seed)-.5)*l.v.xyz;
+  vec3 delta=target-p;float distance=length(delta);
+  vec3 wi=kind==3u?-normalize(l.direction_cone.xyz):delta/max(distance,1e-12);
+  vec3 evaluation=materialEvaluate(surface,wi);if(materialEnergy(evaluation)<=0.)return vec3(0);
+  float pdf=selection,weight=1.;vec3 incident=emission(id);
+  if(kind==2u) {
+    vec3 crossUV=cross(l.u_soft.xyz,l.v.xyz);float area=length(crossUV);
+    float cosLight=emitterCosine(l,crossUV/max(area,1e-20),wi);
+    if(cosLight<=0.)return vec3(0);
+    pdf*=distance*distance/(area*cosLight);
+    weight=powerWeight(pdf,materialPdf(surface,wi));
+  } else if(kind!=3u)incident/=max(distance*distance,1e-12);
+  if(kind==1u) {
+    float outer=cos(radians(l.direction_cone.w));
+    float inner=cos(radians(l.direction_cone.w*(1.-l.u_soft.w)));
+    float cone=dot(-wi,normalize(l.direction_cone.xyz));
+    incident*=inner>outer+1e-6?smoothstep(outer,inner,cone):step(outer,cone);
+  }
+  if(!lightVisible(p,n,wi,target,kind,id))return vec3(0);
+  return evaluation*incident*weight/max(pdf,1e-30);
+}
+bool scatter(inout PathRay ray,uint primitive,vec2 bary) {
+ samplingPixel=ray.state.x;
+ uint id=materialId(primitive);
+ if(materials[id].values[0].x==0.)return scatterLegacy(ray,primitive,bary);
+ Triangle t=triangles[primitive];
+ vec3 p=t.a.xyz*(1.-bary.x-bary.y)+t.b.xyz*bary.x+t.c.xyz*bary.y;
+ vec3 ng=geometricNormal(t),normal=shadingNormal(t,bary,-ray.directionDelta.xyz);
+ uvec3 depth=uvec3(ray.state.z&255u,(ray.state.z>>8)&255u,(ray.state.z>>16)&255u);
+ vec2 uv=t.uv01.xy*(1.-bary.x-bary.y)+t.uv01.zw*bary.x+t.uv2.xy*bary.y;
+ vec2 du=t.uv01.zw-t.uv01.xy,dv=t.uv2.xy-t.uv01.xy;
+ float determinant=du.x*dv.y-du.y*dv.x;
+ vec3 tangent=abs(determinant)>1e-10?((t.b.xyz-t.a.xyz)*dv.y-(t.c.xyz-t.a.xyz)*du.y)/determinant:normalize(cross(abs(normal.z)<.999?vec3(0,0,1):vec3(0,1,0),normal));
+ vec3 bitangent=abs(determinant)>1e-10?((t.c.xyz-t.a.xyz)*du.x-(t.b.xyz-t.a.xyz)*dv.x)/determinant:cross(normal,tangent);
+ MaterialSurface surface=materialPrepare(id,normal,ng,-ray.directionDelta.xyz,ray.throughput.rgb,depth,uv,tangent,bitangent,materialFootprint(t,p));
+ radiance[ray.state.x].rgb+=ray.throughput.rgb*(materialEmission(surface)+surfaceNextEvent(p,ng,surface,ray.state.y));
+ vec3 wi,weight;float pdf;bool delta;uint category;
+ if(!materialSample(surface,ray.state.y,wi,weight,pdf,delta,category))return false;
+ depth[category]++;
+ ray.throughput.rgb*=weight;
+ if(any(isnan(ray.throughput.rgb))||any(isinf(ray.throughput.rgb)))return false;
+ float throughput=max(ray.throughput.r,max(ray.throughput.g,ray.throughput.b));
+ if(throughput<=0.)return false;
+ if(depth.x+depth.y+depth.z>=pc.rouletteStart) {
+  float survival=clamp(throughput,.05,.95);
+  if(pathSample(ray.state.y)>=survival)return false;
+  ray.throughput.rgb/=survival;
+ }
+ ray.originPdf=vec4(p+ng*(dot(ng,wi)>0.?1.:-1.)*epsilonAt(p),pdf);
+ ray.directionDelta=vec4(normalize(wi),delta?1.:0.);
+ ray.state.z=depth.x|(depth.y<<8)|(depth.z<<16);return true;
+}
+void main() {
+  uint index=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64u+gl_LocalInvocationIndex;
+  PathRay ray;bool alive=false;
+  if(pc.rayPhase==0u) {
+    if(index<pc.width*pc.height) {
+      uint pixel=index;Hit hit=hits[pixel];radiance[pixel]=vec4(0,0,0,1);
+      if(hit.primitive==0u)radiance[pixel].rgb=environment();
+      else if((hit.primitive&0x80000000u)!=0u)radiance[pixel].rgb=emission(hit.primitive&0x7fffffffu);
+      else {
+        vec3 origin,direction;float plane;
+        cameraRay(uvec2(pixel%pc.width,pixel/pc.width),origin,direction,plane);
+        ray=PathRay(vec4(origin,0),vec4(direction,1),vec4(1),uvec4(pixel,4u,0,0));
+        alive=scatter(ray,hit.primitive-1u,vec2(hit.u,hit.v));
+      }
+    }
+  } else if(index<counts[pc.queueParity]) {
+    ray=pc.queueParity==0u?raysA[index]:raysB[index];
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q,world,0u,255,ray.originPdf.xyz,1e-5,ray.directionDelta.xyz,1e30);
+    while(rayQueryProceedEXT(q)){
+   if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT) {
+    uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+    if(materialCovered(candidate,rayQueryGetWorldRayOriginEXT(q),rayQueryGetWorldRayDirectionEXT(q)))rayQueryConfirmIntersectionEXT(q);
+   }
+  }
+    bool hit=rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+    float distance=hit?rayQueryGetIntersectionTEXT(q,true):1e30;uint emitter;
+    if(traceLights(ray.originPdf.xyz,ray.directionDelta.xyz,1e-5,distance,emitter)) {
+      vec3 target=ray.originPdf.xyz+distance*ray.directionDelta.xyz;
+      float weight=ray.directionDelta.w>0.?1.:powerWeight(ray.originPdf.w,lightPdf(emitter,ray.originPdf.xyz,target,ray.directionDelta.xyz));
+      radiance[ray.state.x].rgb+=ray.throughput.rgb*emission(emitter)*weight;
+    } else if(!hit)radiance[ray.state.x].rgb+=ray.throughput.rgb*environment();
+    else alive=scatter(ray,rayQueryGetIntersectionPrimitiveIndexEXT(q,true),rayQueryGetIntersectionBarycentricsEXT(q,true));
+  }
+  // Subgroup (warp/wave) compaction: one global reservation per subgroup.
+  // Inactive lanes never enter the next bounce's indirect dispatch.
+  uvec4 activeMask=subgroupBallot(alive);uint activeCount=subgroupBallotBitCount(activeMask);
+  uint outputQueue=pc.rayPhase==0u?0u:1u-pc.queueParity;
+  uint base=0u;
+  if(subgroupElect()&&activeCount>0u)base=atomicAdd(counts[outputQueue],activeCount);
+  base=subgroupBroadcastFirst(base);
+  if(alive) {
+    uint destination=base+subgroupBallotExclusiveBitCount(activeMask);
+    if(outputQueue==0u)raysA[destination]=ray;else raysB[destination]=ray;
+  }
+}

@@ -1,0 +1,43 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "light_bvh.glsl"
+#include "camera.glsl"
+#include "materials/visibility.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(p, uvec2(pc.width, pc.height))))
+    return;
+  uint i=p.y*pc.width+p.x;
+  vec3 origin, direction; float planeScale;
+  cameraRay(p, origin, direction, planeScale);
+  rayQueryEXT q;
+  rayQueryInitializeEXT(q, world, 0u, 255, origin,
+                        camera.clippingOffset.x * planeScale, direction,
+                        camera.clippingOffset.y * planeScale);
+  while(rayQueryProceedEXT(q)){
+   if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT) {
+    uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+    if(triangles[candidate].uv2.z==0. && materialCovered(candidate,rayQueryGetWorldRayOriginEXT(q),rayQueryGetWorldRayDirectionEXT(q)))rayQueryConfirmIntersectionEXT(q);
+   }
+  }
+  hits[i] = Hit(0, 0., 0., 0.,uvec4(0));
+  float closest=camera.clippingOffset.y*planeScale;
+  if (rayQueryGetIntersectionTypeEXT(q, true) !=
+      gl_RayQueryCommittedIntersectionNoneEXT) {
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(q, true);
+    closest=rayQueryGetIntersectionTEXT(q,true);
+    hits[i] =
+        Hit(rayQueryGetIntersectionPrimitiveIndexEXT(q, true) + 1u, bary.x,
+            bary.y, rayQueryGetIntersectionTEXT(q, true) / planeScale,uvec4(0));
+    uint primitive=hits[i].primitive-1u;Triangle t=triangles[primitive];
+    vec2 uv=t.uv01.xy*(1.-bary.x-bary.y)+t.uv01.zw*bary.x+t.uv2.xy*bary.y;
+    hits[i].attributes=uvec4(materialId(primitive),floatBitsToUint(uv),0);
+  }
+  uint emitter;
+  if (tracePrimaryLights(origin,direction,camera.clippingOffset.x*planeScale,closest,emitter))
+    hits[i]=Hit(0x80000000u|emitter,0.,0.,closest/planeScale,uvec4(0));
+}

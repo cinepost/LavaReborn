@@ -1,0 +1,9 @@
+{
+  "Plugins": [{
+    "Type": "library", "Name": "hdLava", "Root": "..",
+    "LibraryPath": "libhdLava.so", "ResourcePath": "resources",
+    "Info": {"Types": {"LavaRendererPlugin": {
+      "bases": ["HdRendererPlugin"], "displayName": "Lava Reborn (Prototype)", "priority": 0
+    }}}
+  }]
+}
