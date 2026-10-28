@@ -321,3 +321,149 @@ fn grayscale_formats_bc4_signedness_ranges_mips_and_cache() {
         PixelFormat::Bc7
     );
 }
+
+#[test]
+fn udim_discovery_and_indirect_handle_abi() {
+    use super::udim::*;
+    assert_eq!(std::mem::size_of::<TextureHandle>(), 16);
+    assert_eq!(std::mem::size_of::<TextureTile>(), 48);
+    assert_eq!(tile_number(0, 0), Some(1001));
+    assert_eq!(tile_number(9, 0), Some(1010));
+    assert_eq!(tile_number(0, 1), Some(1011));
+    assert_eq!(tile_number(8, 899), Some(9999));
+    assert_eq!(tile_number(10, 0), None);
+    assert_eq!(tile_number(-1, 0), None);
+    assert_eq!(tile_number(9, 899), None);
+    let root = Temp::new();
+    let pattern = root.path("asset.<UDIM>.png");
+    for number in [1000, 1001, 1003, 1011, 9999, 10000] {
+        png(
+            &root.path(&format!("asset.{number}.png")),
+            3,
+            5,
+            [255, 0, 0, 255],
+        );
+    }
+    png(&root.path("other.1002.png"), 1, 1, [0; 4]);
+    let tiles = discover(&pattern).unwrap();
+    assert_eq!(
+        tiles.iter().map(|t| t.number).collect::<Vec<_>>(),
+        [1001, 1003, 1011, 9999]
+    );
+    let req = request(pattern, TextureMode::Compressed);
+    let mut catalog = Catalog::new();
+    catalog.configure(&std::collections::HashSet::from([req.clone()]));
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while catalog.pending() {
+        catalog.poll();
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(catalog.tiles(&req), tiles);
+    std::fs::remove_file(root.path("asset.1003.png")).unwrap();
+    png(&root.path("asset.1002.png"), 4, 4, [0, 255, 0, 255]);
+    loop {
+        catalog.poll();
+        if catalog
+            .tiles(&req)
+            .iter()
+            .map(|t| t.number)
+            .collect::<Vec<_>>()
+            == [1001, 1002, 1011, 9999]
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let handle = TextureHandle::placeholder(TextureHandle::UDIM | TextureHandle::VIRTUAL);
+    assert_eq!(
+        handle.flags,
+        TextureHandle::UDIM | TextureHandle::VIRTUAL | TextureHandle::SOLID
+    );
+    assert_eq!(handle.tile_count, 0);
+}
+
+#[test]
+fn empty_udim_sets_fail_final_preparation_and_clear_on_removal() {
+    let root = Temp::new();
+    let req = request(root.path("missing.<UDIM>.png"), TextureMode::Original);
+    let mut catalog = udim::Catalog::new();
+    catalog.configure(&std::collections::HashSet::from([req.clone()]));
+    let until = Instant::now() + Duration::from_secs(5);
+    while catalog.pending() || catalog.scanning() {
+        catalog.poll();
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(catalog
+        .check_errors()
+        .unwrap_err()
+        .to_string()
+        .contains("no UDIM tiles"));
+    catalog.configure(&std::collections::HashSet::new());
+    assert!(!catalog.pending());
+    catalog.check_errors().unwrap();
+}
+
+#[test]
+fn houdini_printf_udim_pattern_and_environment_paths() {
+    let root = Temp::new();
+    let directory = root.path("Library/Assets/bar_island_sink/Textures/bar_island_sink_original");
+    std::fs::create_dir_all(&directory).unwrap();
+    for id in [1001, 1002] {
+        use exr::prelude::*;
+        let channels = SpecificChannels::build()
+            .with_channel("Y")
+            .with_pixel_fn(|_| (0.35f32,));
+        Image::from_channels((7, 3), channels)
+            .write()
+            .to_file(directory.join(format!("bar_island_sink_{id}_Roughness.exr")))
+            .unwrap();
+    }
+    let path = directory.join("bar_island_sink_%(UDIM)d_Roughness.exr");
+    assert!(udim::is_udim(&path));
+    let tiles = udim::discover(&path).unwrap();
+    assert_eq!(
+        tiles.iter().map(|t| t.number).collect::<Vec<_>>(),
+        [1001, 1002]
+    );
+    let binding = TextureBinding {
+        file: path,
+        ..Default::default()
+    };
+    let req = LoadRequest::new(&binding, TextureMode::Compressed, false);
+    assert_eq!(
+        req.file,
+        directory.join("bar_island_sink_<UDIM>_Roughness.exr")
+    );
+    for tile in tiles {
+        let req = LoadRequest {
+            file: tile.file,
+            ..req.clone()
+        };
+        let data = prepare(&req, &root.path("cache")).unwrap();
+        assert_eq!(data.format, PixelFormat::Bc4Unorm);
+        assert_eq!(
+            (
+                data.levels.last().unwrap().width,
+                data.levels.last().unwrap().height
+            ),
+            (1, 1)
+        );
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for prefix in ["$HOME", "${HOME}"] {
+            assert_eq!(
+                normalize_path(Path::new(&format!("{prefix}/asset_%(UDIM)d.exr"))),
+                PathBuf::from(&home).join("asset_<UDIM>.exr")
+            );
+        }
+    }
+    assert_eq!(
+        normalize_path(Path::new(
+            "${LAVA_UNSET_PATH_VARIABLE_7E4A}/asset_%(UDIM)d.exr"
+        )),
+        PathBuf::from("${LAVA_UNSET_PATH_VARIABLE_7E4A}/asset_<UDIM>.exr")
+    );
+}

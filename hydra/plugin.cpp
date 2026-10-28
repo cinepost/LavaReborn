@@ -19,6 +19,8 @@
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/registryManager.h>
 #include <pxr/base/vt/array.h>
+#include <pxr/imaging/hd/basisCurves.h>
+#include <pxr/imaging/hd/basisCurvesTopology.h>
 #include <pxr/imaging/hd/camera.h>
 #include <pxr/imaging/hd/instancer.h>
 #include <pxr/imaging/hd/light.h>
@@ -70,7 +72,7 @@ struct State : HdRenderParam {
   std::mutex mutex;
   uint64_t generation = 0;
   uint64_t geometryGeneration = 0;
-  std::map<SdfPath, std::string> meshes, lights, materials;
+  std::map<SdfPath, std::string> meshes, curves, lights, materials;
   std::map<SdfPath, SdfPath> meshMaterials;
 };
 class Mesh final : public HdMesh {
@@ -275,6 +277,196 @@ protected:
   }
   void _InitRepr(TfToken const &, HdDirtyBits *) override {}
 };
+class Curves final : public HdBasisCurves {
+public:
+  Curves(SdfPath const &id) : HdBasisCurves(id) {}
+  HdDirtyBits GetInitialDirtyBitsMask() const override {
+    return HdChangeTracker::AllDirty;
+  }
+  TfTokenVector const &GetBuiltinPrimvarNames() const override {
+    static TfTokenVector n = {HdTokens->points, HdTokens->widths,
+                              HdTokens->displayColor, TfToken("radius")};
+    return n;
+  }
+  void Sync(HdSceneDelegate *d, HdRenderParam *param, HdDirtyBits *bits,
+            TfToken const &) override {
+    auto *state = static_cast<State *>(param);
+    auto erase = [&]() {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->curves.erase(GetId())) {
+        ++state->generation;
+        ++state->geometryGeneration;
+      }
+      *bits = HdChangeTracker::Clean;
+    };
+    if (!d->GetVisible(GetId())) {
+      erase();
+      return;
+    }
+    auto value = d->Get(GetId(), HdTokens->points);
+    if (!value.IsHolding<VtVec3fArray>()) {
+      erase();
+      return;
+    }
+    auto const &points = value.UncheckedGet<VtVec3fArray>();
+    auto topology = d->GetBasisCurvesTopology(GetId());
+    std::string basis = topology.GetCurveType() == TfToken("linear")
+                            ? "linear"
+                            : topology.GetCurveBasis().GetString();
+    if (basis != "linear" && basis != "bezier" && basis != "catmullRom" &&
+        basis != "bspline") {
+      TF_WARN("Lava: unsupported curve basis %s", basis.c_str());
+      erase();
+      return;
+    }
+    auto wrap = topology.GetCurveWrap();
+    if (wrap == TfToken("pinned")) {
+      TF_WARN("Lava: pinned curves are not yet supported");
+      erase();
+      return;
+    }
+    auto indices = topology.GetCurveIndices();
+    auto counts = topology.GetCurveVertexCounts();
+    auto transform = d->GetTransform(GetId());
+    auto radius = d->Get(GetId(), TfToken("radius"));
+    if (radius.IsEmpty()) {
+      UsdTimeCode time;
+      auto source = lava::MaterialSource(d, GetId(), &time);
+      if (source) {
+        auto attr = source.GetAttribute(TfToken("radius"));
+        if (attr)
+          attr.Get(&radius, time);
+      }
+    }
+    bool custom = !radius.IsEmpty();
+    if (!custom)
+      radius = d->Get(GetId(), HdTokens->widths);
+    std::string rate = "vertex";
+    TfToken radiusName(custom ? "radius" : "widths");
+    for (int r = HdInterpolationConstant; r < HdInterpolationCount; r++)
+      for (auto const &p :
+           d->GetPrimvarDescriptors(GetId(), HdInterpolation(r)))
+        if (p.name == radiusName)
+          rate = r == HdInterpolationConstant  ? "constant"
+                 : r == HdInterpolationUniform ? "uniform"
+                 : r == HdInterpolationVarying ? "varying"
+                                               : "vertex";
+    VtFloatArray radii;
+    if (radius.IsHolding<VtFloatArray>())
+      radii = radius.UncheckedGet<VtFloatArray>();
+    else if (radius.IsHolding<float>())
+      radii.push_back(radius.UncheckedGet<float>());
+    else if (radius.IsHolding<double>())
+      radii.push_back(float(radius.UncheckedGet<double>()));
+    else if (radius.IsHolding<VtDoubleArray>())
+      for (double r : radius.UncheckedGet<VtDoubleArray>())
+        radii.push_back(float(r));
+    if (radii.empty()) {
+      radii.push_back(custom ? .01f : .02f);
+      rate = "constant";
+    }
+    double scale =
+        std::max({transform.TransformDir(GfVec3d(1, 0, 0)).GetLength(),
+                  transform.TransformDir(GfVec3d(0, 1, 0)).GetLength(),
+                  transform.TransformDir(GfVec3d(0, 0, 1)).GetLength()}) *
+        (custom ? 1. : .5);
+    GfVec3f color(.5f);
+    auto colors = d->Get(GetId(), HdTokens->displayColor);
+    if (colors.IsHolding<VtVec3fArray>() &&
+        !colors.UncheckedGet<VtVec3fArray>().empty())
+      color = colors.UncheckedGet<VtVec3fArray>()[0];
+    std::ostringstream o;
+    o << std::setprecision(9) << "{\"basis\":" << lava::JsonString(basis)
+      << ",\"periodic\":" << (wrap == TfToken("periodic") ? "true" : "false")
+      << ",\"points\":[";
+    size_t total = indices.empty() ? points.size() : indices.size();
+    for (size_t i = 0; i < total; i++) {
+      int index = indices.empty() ? int(i) : indices[i];
+      if (index < 0 || size_t(index) >= points.size()) {
+        TF_WARN("Lava: invalid curve index");
+        erase();
+        return;
+      }
+      if (i)
+        o << ',';
+      o << Vec(transform.Transform(GfVec3d(points[index])));
+    }
+    o << "],\"counts\":[";
+    bool first = true;
+    if (wrap == TfToken("segmented")) {
+      for (int n : counts) {
+        if (n % 2) {
+          TF_WARN("Lava: invalid segmented curve count");
+          erase();
+          return;
+        }
+        for (int i = 0; i < n / 2; i++) {
+          if (!first)
+            o << ',';
+          first = false;
+          o << 2;
+        }
+      }
+    } else
+      for (int n : counts) {
+        if (!first)
+          o << ',';
+        first = false;
+        o << n;
+      }
+    o << "],\"radius_interpolation\":" << lava::JsonString(rate)
+      << ",\"radius\":[";
+    if (wrap == TfToken("segmented") && rate == "uniform" && radii.size() > 1) {
+      if (radii.size() != counts.size()) {
+        TF_WARN("Lava: invalid segmented uniform radii");
+        erase();
+        return;
+      }
+      bool firstRadius = true;
+      for (size_t i = 0; i < counts.size(); i++)
+        for (int segment = 0; segment < counts[i] / 2; segment++) {
+          if (!firstRadius)
+            o << ',';
+          firstRadius = false;
+          o << radii[i] * scale;
+        }
+    } else if (!indices.empty() && rate == "vertex" && radii.size() > 1) {
+      for (size_t i = 0; i < indices.size(); i++) {
+        if (size_t(indices[i]) >= radii.size()) {
+          TF_WARN("Lava: invalid indexed curve radius");
+          erase();
+          return;
+        }
+        if (i)
+          o << ',';
+        o << radii[indices[i]] * scale;
+      }
+    } else
+      for (size_t i = 0; i < radii.size(); i++) {
+        if (i)
+          o << ',';
+        o << radii[i] * scale;
+      }
+    o << "],\"color\":" << Vec(GfVec3d(color)) << '}';
+    std::lock_guard<std::mutex> lock(state->mutex);
+    auto text = o.str();
+    auto material = d->GetMaterialId(GetId());
+    if (state->curves[GetId()] != text ||
+        state->meshMaterials[GetId()] != material) {
+      state->curves[GetId()] = text;
+      state->meshMaterials[GetId()] = material;
+      ++state->generation;
+      ++state->geometryGeneration;
+    }
+    *bits = HdChangeTracker::Clean;
+  }
+
+protected:
+  HdDirtyBits _PropagateDirtyBits(HdDirtyBits bits) const override {
+    return bits;
+  }
+  void _InitRepr(TfToken const &, HdDirtyBits *) override {}
+};
 class Light final : public HdLight {
   TfToken type;
 
@@ -357,18 +549,26 @@ public:
             auto source = lava::PrincipledSource(d, GetId(), &materialTime);
             auto textureNetwork = lava::PrincipledNetwork(network.second, node,
                                                           source, materialTime);
-            textures = lava::TextureInputs(textureNetwork, node, true);
+            textures =
+                lava::TextureInputs(textureNetwork, node, true,
+                                    lava::MaterialSource(d, GetId()), GetId());
             if (std::getenv("LAVA_TRACE"))
               std::fprintf(stderr, "Lava textures (%s): {%s}\n",
                            source ? "Principled" : "USD", textures.c_str());
             auto scalar = [&](const char *name, float fallback) {
               if (source) {
                 const char *authored =
-                    std::string(name) == "roughness" ? "rough" : name;
+                    std::string(name) == "roughness"      ? "rough"
+                    : std::string(name) == "transmission" ? "transparency"
+                    : std::string(name) == "opacity"      ? "opac"
+                                                          : name;
                 auto value =
                     lava::PrincipledValue(source, authored, materialTime);
                 if (value.IsHolding<float>())
                   return value.UncheckedGet<float>();
+                if (std::string(name) == "opacity")
+                  return fallback; // Preview opacity also includes
+                                   // transparency.
               }
               auto p = node.parameters.find(TfToken(name));
               return p != node.parameters.end() && p->second.IsHolding<float>()
@@ -400,6 +600,15 @@ public:
                 previewBase = authored.UncheckedGet<GfVec3f>();
             }
             preview << ",\"base_color\":" << Vec(GfVec3d(previewBase));
+            if (source) {
+              auto tint =
+                  lava::PrincipledValue(source, "transcolor", materialTime);
+              GfVec3f transmissionColor(1.f);
+              if (tint.IsHolding<GfVec3f>())
+                transmissionColor = tint.UncheckedGet<GfVec3f>();
+              preview << ",\"transmission_color\":"
+                      << Vec(GfVec3d(transmissionColor));
+            }
             auto emissive = node.parameters.find(TfToken("emissiveColor"));
             if (emissive != node.parameters.end() &&
                 emissive->second.IsHolding<GfVec3f>())
@@ -412,6 +621,9 @@ public:
               preview << ",\"emission_luminance\":1";
             preview << "}";
             openpbr = preview.str();
+            if (source && std::getenv("LAVA_TRACE"))
+              std::fprintf(stderr, "Lava OpenPBR (Principled): %s\n",
+                           openpbr.c_str());
             auto p = node.parameters.find(TfToken("diffuseColor"));
             if (p != node.parameters.end() && p->second.IsHolding<GfVec3f>()) {
               color = p->second.UncheckedGet<GfVec3f>();
@@ -421,7 +633,9 @@ public:
           if (node.identifier == TfToken("ND_open_pbr_surface_surfaceshader") ||
               node.identifier == TfToken("open_pbr_surface") ||
               node.identifier == TfToken("OpenPBRSurface")) {
-            textures = lava::TextureInputs(network.second, node, false);
+            textures =
+                lava::TextureInputs(network.second, node, false,
+                                    lava::MaterialSource(d, GetId()), GetId());
             std::ostringstream material;
             material << std::setprecision(9) << "{";
             bool first = true;
@@ -702,7 +916,8 @@ public:
     return registry;
   }
   TfTokenVector const &GetSupportedRprimTypes() const override {
-    static TfTokenVector v = {HdPrimTypeTokens->mesh};
+    static TfTokenVector v = {HdPrimTypeTokens->mesh,
+                              HdPrimTypeTokens->basisCurves};
     return v;
   }
   TfTokenVector const &GetSupportedSprimTypes() const override {
@@ -726,12 +941,17 @@ public:
   }
   void DestroyInstancer(HdInstancer *i) override { delete i; }
   HdRprim *CreateRprim(TfToken const &t, SdfPath const &id) override {
-    return t == HdPrimTypeTokens->mesh ? new Mesh(id) : nullptr;
+    if (t == HdPrimTypeTokens->mesh)
+      return new Mesh(id);
+    if (t == HdPrimTypeTokens->basisCurves)
+      return new Curves(id);
+    return nullptr;
   }
   void DestroyRprim(HdRprim *p) override {
     {
       std::lock_guard<std::mutex> lock(state.mutex);
       state.meshes.erase(p->GetId());
+      state.curves.erase(p->GetId());
       ++state.generation;
       ++state.geometryGeneration;
     }
@@ -791,6 +1011,8 @@ public:
              VtValue(8)},
             {"Russian roulette start depth", TfToken("lava:rouletteStart"),
              VtValue(3)},
+            {"Reduce analytic light caustics",
+             TfToken("lava:reduceAnalyticCaustics"), VtValue(false)},
             {"Automatic viewport headlight", TfToken("lava:headlight"),
              VtValue(true)}};
   }
@@ -843,6 +1065,11 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     << ",\"reflection_depth\":" << depth("lava:reflectionDepth", 4, 32)
     << ",\"refraction_depth\":" << depth("lava:refractionDepth", 8, 32)
     << ",\"roulette_start\":" << depth("lava:rouletteStart", 3, 96)
+    << ",\"reduce_analytic_caustics\":"
+    << (delegate->GetRenderSetting(TfToken("lava:reduceAnalyticCaustics"),
+                                   false)
+            ? "true"
+            : "false")
     << "},\"camera\":{\"transform\":[";
   // Gf uses row vectors; copying row-major entries yields the transposed matrix
   // expected by Rust/GLSL column-vector convention.
@@ -891,6 +1118,28 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
       bool first = true;
       if (!viewOnly)
         for (auto const &p : state.meshes) {
+          if (!first)
+            o << ',';
+          first = false;
+          auto material = state.materials.find(state.meshMaterials[p.first]);
+          if (material == state.materials.end())
+            o << p.second;
+          else {
+            // Replace the trailing color field rather than emit duplicate JSON
+            // keys.
+            auto color = p.second.rfind(",\"color\":");
+            auto overrideColor = material->second.find(",\"color\":");
+            if (overrideColor == std::string::npos)
+              o << p.second.substr(0, p.second.size() - 1) << material->second
+                << '}';
+            else
+              o << p.second.substr(0, color) << material->second << '}';
+          }
+        }
+      o << "],\"curves\":[";
+      first = true;
+      if (!viewOnly)
+        for (auto const &p : state.curves) {
           if (!first)
             o << ',';
           first = false;

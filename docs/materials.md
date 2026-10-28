@@ -14,7 +14,8 @@ frontend can lower graph outputs to the same IR and generate evaluation code
 behind the existing product interfaces. It should use MaterialXGenGlsl or Slang
 without embedding a raster lighting loop in a path tracing BSDF. MaterialX graph
 execution is not implemented by accepting an OpenPBR terminal ID. Direct
-`UsdUVTexture` connections are supported separately; see [textures](textures.md).
+`UsdUVTexture` connections, including sparse UDIM sets, are supported separately;
+see [textures](textures.md).
 
 ## GPU products and ownership
 

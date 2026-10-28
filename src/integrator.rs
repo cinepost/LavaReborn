@@ -17,6 +17,7 @@ pub struct IntegratorSettings {
     pub reflection_depth: u32,
     pub refraction_depth: u32,
     pub roulette_start: u32,
+    pub reduce_analytic_caustics: bool,
 }
 impl Default for IntegratorSettings {
     fn default() -> Self {
@@ -27,6 +28,7 @@ impl Default for IntegratorSettings {
             reflection_depth: 4,
             refraction_depth: 8,
             roulette_start: 3,
+            reduce_analytic_caustics: false,
         }
     }
 }

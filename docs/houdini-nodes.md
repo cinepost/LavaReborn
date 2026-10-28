@@ -10,7 +10,8 @@ settings-primitive header, camera/resolution controls, and grouped tabs:
 
 - Sampling: interactive/final mode, ray-query/raster visibility, samples, headlight.
 - Textures: Original, Compressed (BC4/BC7), or Virtual (inactive); see [texture settings](textures.md).
-- Limits: diffuse, reflection, refraction limits and Russian roulette start depth.
+- Limits: diffuse, reflection, refraction limits, Russian roulette start depth,
+  and **Reduce Analytic Light Caustics** (off by default).
 - Image: display exposure in stops. Floating-point exposure edits reprocess the
   existing filtered image on the GPU without clearing history or restarting the
   sample counter, including after convergence.
@@ -20,6 +21,17 @@ viewport's Render Settings Prim selector if viewport overrides are active.
 Camera optics, focus distance and f-stop remain on the standard Camera LOP.
 No unsupported render products, output formats, denoisers, or adaptive sampling
 controls are exposed.
+
+**Reduce Analytic Light Caustics** is an opt-in biased firefly control for both
+interactive and final rendering. It caps the largest RGB component of reflected
+analytic-light sample multipliers at 16, preserving their color ratios, before
+applying light intensity. It covers point, spot and directional next-event
+samples, rectangular-light next-event samples, and analytic emitter hits after
+reflection. Diffuse contributions, transmission, environment and material
+emission are not clamped. It can dim sharp highlights and does not guarantee
+removal of every firefly. Toggling it resets accumulation without rebuilding
+geometry. USD uses `lava:reduceAnalyticCaustics`; JSON scenes use
+`settings.reduce_analytic_caustics`.
 
 Connect Lava Light Properties after light creation. Its Primitives field accepts
 Solaris selection patterns. It exposes exactly two renderer controls:

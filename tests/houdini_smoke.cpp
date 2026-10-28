@@ -1,3 +1,4 @@
+#include "../hydra/texturePaths.h"
 #include "gl_context.h"
 #include "lava.h"
 // Exercise Solaris' HUSD imaging/AOV interface, not only upstream Hdx tasks.
@@ -114,11 +115,54 @@ extern "C" int lava_houdini_smoke(const char *path, const char *cameraPath) {
             << " CPU color=" << capture.cpuColor
             << ", depth=" << capture.cpuDepth
             << ", empty clear callbacks=" << capture.clears << "\n";
+  bool texturePixels = true;
+  if (b && std::getenv("LAVA_TEST_TEXTURES")) {
+    auto *pixels = static_cast<const float *>(b.map());
+    if (!pixels)
+      texturePixels = false;
+    else
+      for (auto sample : {GfVec2f(-1.4f, 0), GfVec2f(-.5f, 1), GfVec2f(.5f, 0),
+                          GfVec2f(1.4f, 1)}) {
+        int x = int((sample[0] / 4.f + .5f) * b.xres());
+        auto *p = pixels + ((b.yres() / 2) * b.xres() + x) * 4;
+        float wanted = sample[1] > 0 ? p[2] : p[0],
+              other = sample[1] > 0 ? p[0] : p[2];
+        if (wanted < .1f || wanted < other * 3.f) {
+          texturePixels = false;
+          std::cerr << "HUSD texture sample failed at " << sample[0] << ": "
+                    << p[0] << "," << p[1] << "," << p[2] << "\n";
+        }
+      }
+    b.unmap();
+    if (texturePixels)
+      std::cout << "PASS: Solaris sampled expected UDIM red/blue tiles\n";
+  }
+  if (b && std::getenv("LAVA_TEST_CURVES")) {
+    auto *pixels = static_cast<const float *>(b.map());
+    size_t bright = 0, total = size_t(b.xres()) * b.yres();
+    if (pixels)
+      for (size_t i = 0; i < total; i++) {
+        auto *p = pixels + i * 4;
+        if (p[0] > .4f && p[0] > p[2] * 1.2f)
+          ++bright;
+      }
+    b.unmap();
+    texturePixels = texturePixels && pixels && bright > total / 200;
+    std::cout << (texturePixels ? "PASS" : "FAIL")
+              << ": native curved strand pixels=" << bright << "/" << total
+              << "\n";
+  }
   auto transfers = lava_image_readback_count() - baseline;
   std::cerr << "Actual Lava GPU-to-CPU frame readbacks: " << transfers << "\n";
-  return b && imaging.isConverged() && capture.gpuColor > 0 &&
+  return texturePixels && b && imaging.isConverged() && capture.gpuColor > 0 &&
                  capture.gpuDepth > 0 && capture.cpuColor == 0 &&
                  capture.cpuDepth == 0
              ? 0
              : 6;
+}
+
+extern "C" const char *lava_houdini_texture_path(const char *path) {
+  static thread_local std::string result;
+  result = lava::ExpandTexturePath(path ? path : "");
+  return result.c_str();
 }

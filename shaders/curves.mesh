@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "camera.glsl"
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=16,max_primitives=28) out;
+struct Payload {uint ids[32];};
+taskPayloadSharedEXT Payload payload;
+layout(location=0) out vec3 barycentric[];
+layout(location=1) flat out uint primitive[];
+void main(){
+ uint id=payload.ids[gl_WorkGroupID.x],lane=gl_LocalInvocationIndex;
+ Triangle c=triangles[id];vec3 ab=c.b.xyz-c.a.xyz;
+ vec3 axis=length(ab)>1e-10?normalize(ab):vec3(0,0,1);
+ vec3 midpoint=(c.a.xyz+c.b.xyz)*.5;
+ vec3 view=camera.optics.w>0.?camera.cameraToWorld[2].xyz:camera.cameraToWorld[3].xyz-midpoint;
+ vec3 x=cross(axis,view);if(dot(x,x)<1e-12)x=cross(axis,abs(axis.z)<.999?vec3(0,0,1):vec3(0,1,0));x=normalize(x);vec3 y=cross(axis,x);
+ float radius=max(c.a.w,c.b.w);SetMeshOutputsEXT(16u,28u);
+ if(lane<16u){
+  float angle=6.2831853*float(lane%8u)/8.;
+  vec3 center=lane<8u?c.a.xyz-axis*radius:c.b.xyz+axis*radius;
+  // Circumscribed hull covers the analytic round surface and both endcaps.
+  vec3 world=center+(x*cos(angle)+y*sin(angle))*(radius/0.9238795325);
+  gl_MeshVerticesEXT[lane].gl_Position=cameraProjection()*vec4((camera.worldToCamera*vec4(world,1)).xyz-cameraLens(),1);
+  barycentric[lane]=vec3(0);primitive[lane]=id;
+ }
+ if(lane<16u){uint side=lane/2u,next=(side+1u)%8u;gl_PrimitiveTriangleIndicesEXT[lane]=(lane%2u)==0u?uvec3(side,next,side+8u):uvec3(next,next+8u,side+8u);}
+ else if(lane<22u){uint i=lane-16u+1u;gl_PrimitiveTriangleIndicesEXT[lane]=uvec3(0,i+1u,i);}
+ else if(lane<28u){uint i=lane-22u+1u;gl_PrimitiveTriangleIndicesEXT[lane]=uvec3(8,8+i,8+i+1u);}
+}

@@ -92,8 +92,14 @@ fn main() -> Result<()> {
             ensure!(samples > 0, "samples must be positive");
             let scene_path = scene;
             let mut scene: Scene = serde_json::from_slice(&std::fs::read(&scene_path)?)?;
-            for mesh in &mut scene.meshes {
-                for texture in mesh.material.textures.values_mut() {
+            for material in scene
+                .meshes
+                .iter_mut()
+                .map(|m| &mut m.material)
+                .chain(scene.curves.iter_mut().map(|c| &mut c.material))
+            {
+                for texture in material.textures.values_mut() {
+                    texture.file = lava_reborn::texture::normalize_path(&texture.file);
                     if texture.file.is_relative() {
                         texture.file = scene_path
                             .parent()

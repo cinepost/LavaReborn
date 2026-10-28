@@ -1,4 +1,5 @@
 #pragma once
+#include "texturePaths.h"
 #include <algorithm>
 #include <cstdio>
 #include <iomanip>
@@ -7,6 +8,7 @@
 #include <pxr/base/gf/vec4f.h>
 #include <pxr/imaging/hd/material.h>
 #include <pxr/usd/sdf/assetPath.h>
+#include <pxr/usd/usd/stage.h>
 #include <set>
 #include <sstream>
 
@@ -28,7 +30,9 @@ inline std::string JsonString(std::string const &value) {
   return out.str();
 }
 inline std::string TextureInputs(HdMaterialNetwork const &network,
-                                 HdMaterialNode const &terminal, bool preview) {
+                                 HdMaterialNode const &terminal, bool preview,
+                                 UsdPrim const &material = UsdPrim(),
+                                 SdfPath const &cacheId = SdfPath()) {
   std::ostringstream out;
   bool first = true;
   for (auto const &connection : network.relationships) {
@@ -40,6 +44,8 @@ inline std::string TextureInputs(HdMaterialNetwork const &network,
           {"diffuseColor", "base_color"},
           {"metallic", "base_metalness"},
           {"roughness", "specular_roughness"},
+          {"transmission", "transmission_weight"},
+          {"transmissionColor", "transmission_color"},
           {"ior", "specular_ior"},
           {"opacity", "geometry_opacity"},
           {"normal", "normal"},
@@ -83,20 +89,25 @@ inline std::string TextureInputs(HdMaterialNetwork const &network,
     std::string path;
     if (asset.IsHolding<SdfAssetPath>()) {
       auto const &a = asset.UncheckedGet<SdfAssetPath>();
-      path =
-          a.GetResolvedPath().empty() ? a.GetAssetPath() : a.GetResolvedPath();
+      path = IsUdimPath(a.GetAssetPath()) || a.GetResolvedPath().empty()
+                 ? a.GetAssetPath()
+                 : a.GetResolvedPath();
     } else if (asset.IsHolding<std::string>())
       path = asset.UncheckedGet<std::string>();
+    path = ExpandTexturePath(path);
     if (path.empty()) {
       std::printf(
           "Lava [WARNING]: empty texture asset for %s; using constant.\n",
           field.c_str());
       continue;
     }
-    if (path.find("<UDIM>") != std::string::npos) {
-      std::printf("Lava [WARNING]: UDIM textures are not yet supported: %s\n",
-                  path.c_str());
-      continue;
+    if (path.find("<UDIM>") != std::string::npos && material) {
+      auto sourcePath = image->path;
+      if (sourcePath.HasPrefix(cacheId))
+        sourcePath = sourcePath.ReplacePrefix(cacheId, material.GetPath());
+      auto shader = material.GetStage()->GetPrimAtPath(sourcePath);
+      if (shader)
+        path = AnchorUdim(shader.GetAttribute(TfToken("inputs:file")), path);
     }
     auto token = [&](char const *name, std::string fallback) -> std::string {
       auto value = parameter(name);

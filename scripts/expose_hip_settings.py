@@ -20,6 +20,7 @@ values={
  'lava:reflectionDepth':(Sdf.ValueTypeNames.Int,node.evalParm('reflection_depth')),
  'lava:refractionDepth':(Sdf.ValueTypeNames.Int,node.evalParm('refraction_depth')),
  'lava:rouletteStart':(Sdf.ValueTypeNames.Int,node.evalParm('roulette_start')),
+ 'lava:reduceAnalyticCaustics':(Sdf.ValueTypeNames.Bool,bool(node.evalParm('reduce_analytic_caustics')) if node.parm('reduce_analytic_caustics') else False),
 }
 stage=node.editableStage()
 settings=UsdRender.Settings.Define(stage,path)
@@ -58,6 +59,7 @@ def build(args):
     for name,label,default in [('diffuse_depth','Diffuse Bounces',3),('reflection_depth','Reflection Bounces',4),('refraction_depth','Refraction / Glass Bounces',8)]:
         depths.addParmTemplate(hou.IntParmTemplate(name,label,1,default_value=(default,),min=0,max=32,min_is_strict=True,max_is_strict=True,help='Independent scattering limit; zero disables this lobe.'))
     depths.addParmTemplate(hou.IntParmTemplate('roulette_start','Russian Roulette Start Depth',1,default_value=(3,),min=0,max=96,min_is_strict=True,max_is_strict=True,help='Start after this many total bounces. Set above the sum of limits to disable roulette.'))
+    depths.addParmTemplate(hou.ToggleParmTemplate('reduce_analytic_caustics','Reduce Analytic Light Caustics',default_value=False,help='Biased firefly reduction for reflected analytic-light contributions. Very sharp highlights can become dimmer. Diffuse lighting and emissive materials remain unchanged.'))
     folder.addParmTemplate(depths)
     output=hou.FolderParmTemplate('scene_output','Camera and Output',folder_type=hou.folderType.Simple)
     output.addParmTemplate(hou.StringParmTemplate('camera_path','USD Camera',1,default_value=(camera,)))

@@ -36,6 +36,9 @@ struct Push {
     max_groups_x: u32,
     sampling_mode: u32,
     target_samples: u32,
+    reduce_analytic_caustics: u32,
+    mesh_triangles: u32,
+    curve_count: u32,
 }
 /// Owns resources produced by this pass. Inputs refer to producers via the compiled DAG.
 pub(crate) struct PreparedGeometry {
@@ -47,6 +50,10 @@ pub(crate) struct PreparedGeometry {
     tlas: Acceleration,
     texture_materials: Vec<crate::material::Material>,
     texture_mode: crate::texture::TextureMode,
+    curve_blas: Option<Acceleration>,
+    curve_bounds: Option<Buffer>,
+    mesh_triangles: u32,
+    curve_count: u32,
 }
 struct GpuPass {
     output: Buffer,
@@ -96,6 +103,11 @@ impl GpuPass {
     }
 }
 pub struct Renderer {
+    warned_curve_fallback: bool,
+    curve_blas: Option<Acceleration>,
+    curve_bounds: Option<Buffer>,
+    mesh_triangles: u32,
+    curve_count: u32,
     textures: crate::texture::gpu::MaterialTextures,
     #[cfg(test)]
     coherent_camera_reference: bool,
@@ -126,6 +138,10 @@ pub struct Renderer {
     pipeline_cache: crate::material::pipeline_cache::PipelineCache,
 }
 impl Renderer {
+    fn raster_enabled(&self) -> bool {
+        self.settings.visibility == crate::integrator::VisibilityMode::Raster
+            && (self.curve_count == 0 || self.device.mesh_shader)
+    }
     pub fn new(width: u32, height: u32, mode: Mode, gpu: Option<usize>) -> Result<Self> {
         ensure!(
             width > 0 && height > 0 && width <= 16384 && height <= 16384,
@@ -137,6 +153,11 @@ impl Renderer {
         let material_luts = crate::material::upload_luts(device.clone())?;
         let sample_primes = crate::sampling::upload(device.clone())?;
         let mut r = Self {
+            warned_curve_fallback: false,
+            curve_blas: None,
+            curve_bounds: None,
+            mesh_triangles: 0,
+            curve_count: 0,
             sample_primes,
             sampling_target: 0,
             material_luts,
@@ -197,7 +218,7 @@ impl Renderer {
                 .get_physical_device_properties(r.device.physical)
                 .limits
                 .max_compute_work_group_count[0];
-            let bindings: Vec<_> = (0..20)
+            let bindings: Vec<_> = (0..21)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
@@ -214,12 +235,8 @@ impl Renderer {
                             _ => vk::DescriptorType::STORAGE_BUFFER,
                         })
                         .stage_flags(match binding {
-                            1 | 7 | 17 => {
-                                vk::ShaderStageFlags::COMPUTE
-                                    | vk::ShaderStageFlags::VERTEX
-                                    | vk::ShaderStageFlags::FRAGMENT
-                            }
-                            13 | 18 | 19 => {
+                            1 | 7 | 17 => r.device.shader_stages(),
+                            13 | 18 | 19 | 20 => {
                                 vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::FRAGMENT
                             }
                             _ => vk::ShaderStageFlags::COMPUTE,
@@ -232,11 +249,7 @@ impl Renderer {
             )?;
             let layouts = [r.set_layout];
             let push = [vk::PushConstantRange::default()
-                .stage_flags(
-                    vk::ShaderStageFlags::COMPUTE
-                        | vk::ShaderStageFlags::VERTEX
-                        | vk::ShaderStageFlags::FRAGMENT,
-                )
+                .stage_flags(r.device.shader_stages())
                 .size(std::mem::size_of::<Push>() as u32)];
             r.layout = r.device.raw.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -259,7 +272,7 @@ impl Renderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 15,
+                    descriptor_count: 16,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -439,6 +452,8 @@ impl Renderer {
         mode: Mode,
     ) -> Result<PreparedGeometry> {
         let (triangles, diagnostics) = scene.prepare_geometry()?;
+        let mesh_triangles = triangles.iter().take_while(|t| t.normal_b[3] == 0.).count() as u32;
+        let curve_count = triangles.len() as u32 - mesh_triangles;
         if diagnostics.skipped_faces > 0 || diagnostics.skipped_triangles > 0 {
             eprintln!("Lava: omitted {} unusable faces and {} zero-area triangles; rendering {} valid triangles", diagnostics.skipped_faces, diagnostics.skipped_triangles, triangles.len());
         }
@@ -451,6 +466,7 @@ impl Renderer {
         // BLAS positions are tightly packed; shading triangles retain std430 layout independently.
         let positions: Vec<[f32; 3]> = triangles
             .iter()
+            .take(mesh_triangles as usize)
             .flat_map(|t| {
                 [
                     t.a[..3].try_into().unwrap(),
@@ -476,7 +492,7 @@ impl Renderer {
         let blas = Acceleration::build(
             device.clone(),
             geometry,
-            triangles.len() as u32,
+            mesh_triangles,
             false,
             mode.policy().fast_build,
         )?;
@@ -493,16 +509,63 @@ impl Renderer {
                 device_handle: blas.address(),
             },
         };
+        let mut instance_records = vec![instance];
+        let (curve_blas, curve_bounds) = if curve_count > 0 {
+            let mut bounds = Vec::<[f32; 6]>::new();
+            for t in &triangles[mesh_triangles as usize..] {
+                let r = t.a[3].max(t.b[3]);
+                bounds.push([
+                    t.a[0].min(t.b[0]) - r,
+                    t.a[1].min(t.b[1]) - r,
+                    t.a[2].min(t.b[2]) - r,
+                    t.a[0].max(t.b[0]) + r,
+                    t.a[1].max(t.b[1]) + r,
+                    t.a[2].max(t.b[2]) + r,
+                ]);
+            }
+            let buffer = Buffer::new(device.clone(), (bounds.len() * 24) as u64, usage, true)?;
+            buffer.write(bytemuck::cast_slice(&bounds))?;
+            let data = vk::AccelerationStructureGeometryAabbsDataKHR::default()
+                .data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: buffer.address(),
+                })
+                .stride(24);
+            let geometry = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::AABBS)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs: data });
+            let acceleration = Acceleration::build(
+                device.clone(),
+                geometry,
+                curve_count,
+                false,
+                mode.policy().fast_build,
+            )?;
+            let mut curve_instance = instance;
+            curve_instance.instance_custom_index_and_mask =
+                vk::Packed24_8::new(mesh_triangles, 255);
+            curve_instance.acceleration_structure_reference =
+                vk::AccelerationStructureReferenceKHR {
+                    device_handle: acceleration.address(),
+                };
+            instance_records.push(curve_instance);
+            (Some(acceleration), Some(buffer))
+        } else {
+            (None, None)
+        };
+        ensure!(
+            mesh_triangles < 0x1000000,
+            "curve instance primitive offset exceeds 24-bit Vulkan limit"
+        );
         let instances = Buffer::new(
             device.clone(),
-            std::mem::size_of_val(&instance) as u64,
+            (std::mem::size_of_val(&instance) * instance_records.len()) as u64,
             usage,
             true,
         )?;
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                (&instance as *const vk::AccelerationStructureInstanceKHR).cast::<u8>(),
-                std::mem::size_of_val(&instance),
+                instance_records.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&instance) * instance_records.len(),
             )
         };
         instances.write(bytes)?;
@@ -514,11 +577,25 @@ impl Renderer {
         let geometry = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)
             .geometry(vk::AccelerationStructureGeometryDataKHR { instances: data });
-        let tlas =
-            Acceleration::build(device.clone(), geometry, 1, true, mode.policy().fast_build)?;
+        let tlas = Acceleration::build(
+            device.clone(),
+            geometry,
+            instance_records.len() as u32,
+            true,
+            mode.policy().fast_build,
+        )?;
         let materials = crate::material::upload(device.clone(), scene)?;
         Ok(PreparedGeometry {
-            texture_materials: scene.meshes.iter().map(|m| m.material.clone()).collect(),
+            texture_materials: scene
+                .meshes
+                .iter()
+                .map(|m| m.material.clone())
+                .chain(scene.curves.iter().map(|c| c.material.clone()))
+                .collect(),
+            curve_blas,
+            curve_bounds,
+            mesh_triangles,
+            curve_count,
             texture_mode: scene.settings.textures,
             materials,
             tri,
@@ -532,6 +609,14 @@ impl Renderer {
         self.device.clone()
     }
     pub(crate) fn install_geometry(&mut self, geometry: PreparedGeometry) -> Result<()> {
+        if geometry.curve_count > 0 && !self.device.mesh_shader && !self.warned_curve_fallback {
+            eprintln!("Lava [WARNING]: mesh/task shaders unavailable; curve scenes use hardware ray-query visibility instead of raster visibility.");
+            self.warned_curve_fallback = true;
+        }
+        self.mesh_triangles = geometry.mesh_triangles;
+        self.curve_count = geometry.curve_count;
+        self.curve_blas = geometry.curve_blas;
+        self.curve_bounds = geometry.curve_bounds;
         self.textures
             .configure(geometry.texture_materials, geometry.texture_mode)?;
         let placeholder = || {
@@ -561,7 +646,12 @@ impl Renderer {
         }
         self.scene_buffers[5] = crate::material::upload(self.device.clone(), scene)?;
         self.textures.configure(
-            scene.meshes.iter().map(|m| m.material.clone()).collect(),
+            scene
+                .meshes
+                .iter()
+                .map(|m| m.material.clone())
+                .chain(scene.curves.iter().map(|c| c.material.clone()))
+                .collect(),
             self.settings.textures,
         )?;
         Ok(())
@@ -600,8 +690,7 @@ impl Renderer {
                 c.f_stop,
                 c.focus_distance,
                 {
-                    let independent =
-                        self.settings.visibility == crate::integrator::VisibilityMode::RayQuery;
+                    let independent = !self.raster_enabled();
                     #[cfg(test)]
                     let independent = independent && !self.coherent_camera_reference;
                     if independent {
@@ -715,9 +804,7 @@ impl Renderer {
         if remaining > 0 {
             self.sampling_target = target;
         }
-        if self.settings.visibility == crate::integrator::VisibilityMode::Raster
-            && self.passes[0].raster.is_none()
-        {
+        if self.raster_enabled() && self.passes[0].raster.is_none() {
             self.passes[0].raster = Some(crate::raster::RasterVisibility::new(
                 self.device.clone(),
                 self.width,
@@ -813,6 +900,9 @@ impl Renderer {
                         reflection_depth: self.settings.reflection_depth,
                         refraction_depth: self.settings.refraction_depth,
                         roulette_start: self.settings.roulette_start,
+                        reduce_analytic_caustics: self.settings.reduce_analytic_caustics as u32,
+                        mesh_triangles: self.mesh_triangles,
+                        curve_count: self.curve_count,
                         ray_phase: 0,
                         queue_parity: 0,
                         max_groups_x: self.max_groups_x,
@@ -822,9 +912,7 @@ impl Renderer {
                     device.raw.cmd_push_constants(
                         cmd,
                         self.layout,
-                        vk::ShaderStageFlags::COMPUTE
-                            | vk::ShaderStageFlags::VERTEX
-                            | vk::ShaderStageFlags::FRAGMENT,
+                        self.device.shader_stages(),
                         0,
                         bytemuck::bytes_of(&push),
                     );
@@ -842,17 +930,14 @@ impl Renderer {
                         {
                             continue;
                         }
-                        let raster_visibility = pass == 0
-                            && self.settings.visibility
-                                == crate::integrator::VisibilityMode::Raster;
+                        let raster_visibility = pass == 0 && self.raster_enabled();
                         if raster_visibility {
                             self.passes[0].raster.as_ref().unwrap().record(
                                 cmd,
                                 self.layout,
                                 self.set,
-                                (self.scene_buffers[0].size
-                                    / std::mem::size_of::<crate::scene::Triangle>() as u64
-                                    * 3) as u32,
+                                self.mesh_triangles * 3,
+                                self.curve_count,
                             );
                         }
                         device.raw.cmd_bind_pipeline(
@@ -926,9 +1011,7 @@ impl Renderer {
                                 device.raw.cmd_push_constants(
                                     cmd,
                                     self.layout,
-                                    vk::ShaderStageFlags::COMPUTE
-                                        | vk::ShaderStageFlags::VERTEX
-                                        | vk::ShaderStageFlags::FRAGMENT,
+                                    self.device.shader_stages(),
                                     0,
                                     bytemuck::bytes_of(&push),
                                 );
@@ -988,9 +1071,7 @@ impl Renderer {
                             device.raw.cmd_push_constants(
                                 cmd,
                                 self.layout,
-                                vk::ShaderStageFlags::COMPUTE
-                                    | vk::ShaderStageFlags::VERTEX
-                                    | vk::ShaderStageFlags::FRAGMENT,
+                                self.device.shader_stages(),
                                 0,
                                 bytemuck::bytes_of(&push),
                             );
@@ -1094,6 +1175,7 @@ mod path_tests {
     };
     fn fixture() -> Scene {
         Scene {
+            curves: Vec::new(),
             settings: IntegratorSettings {
                 textures: crate::texture::TextureMode::Original,
                 visibility: Default::default(),
@@ -1101,6 +1183,7 @@ mod path_tests {
                 reflection_depth: 0,
                 refraction_depth: 0,
                 roulette_start: 96,
+                reduce_analytic_caustics: false,
             },
             camera: Camera {
                 transform: glam::Mat4::from_translation(glam::Vec3::new(0., 0., 0.5))
@@ -1303,6 +1386,190 @@ mod path_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    #[ignore = "requires hardware ray queries; sparse UDIM table, per-tile formats/mips/HDR and fallback in both visibility paths"]
+    fn udim_handles_resolve_sparse_mixed_tiles_and_virtual_placeholders() {
+        use crate::integrator::VisibilityMode;
+        use crate::texture::{ColorSpace, TextureBinding, TextureHandle, TextureMode};
+        let root = std::env::temp_dir().join(format!("lava-udim-gpu-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = root.join("asset.<UDIM>.exr");
+        image::Rgb32FImage::from_pixel(7, 3, image::Rgb([4., 0.25, 0.5]))
+            .save(root.join("asset.1001.exr"))
+            .unwrap();
+        image::Rgb32FImage::from_pixel(9, 7, image::Rgb([0., 0.125, 2.]))
+            .save(root.join("asset.1011.exr"))
+            .unwrap();
+        for (id, value) in [(1002, -0.5f32), (1013, 0.25)] {
+            use exr::prelude::*;
+            let channels = SpecificChannels::build()
+                .with_channel("Y")
+                .with_pixel_fn(|_| (value,));
+            Image::from_channels((4, 8), channels)
+                .write()
+                .to_file(root.join(format!("asset.{id}.exr")))
+                .unwrap();
+        }
+        for visibility in [VisibilityMode::RayQuery, VisibilityMode::Raster] {
+            let mut renderer = Renderer::new(48, 32, Mode::Final, None).unwrap();
+            renderer.linear_output = true;
+            for mode in [
+                TextureMode::Original,
+                TextureMode::Compressed,
+                TextureMode::Virtual,
+            ] {
+                let mut scene = fixture();
+                scene.settings.visibility = visibility;
+                scene.settings.textures = mode;
+                scene.settings.diffuse_depth = 0;
+                scene.settings.reflection_depth = 0;
+                scene.settings.refraction_depth = 0;
+                scene.lights.clear();
+                scene.camera.horizontal_aperture = 6.;
+                scene.camera.vertical_aperture = 4.;
+                let mesh = &mut scene.meshes[0];
+                mesh.points = vec![[-3., -2., 0.], [3., -2., 0.], [3., 2., 0.], [-3., 2., 0.]];
+                mesh.texcoords = vec![[0., 0.], [3., 0.], [3., 2.], [0., 2.]];
+                mesh.material.openpbr = Some(crate::material::OpenPbrSurface {
+                    base_weight: 0.,
+                    specular_weight: 0.,
+                    emission_luminance: 1.,
+                    emission_color: [0.125, 0.25, 0.375],
+                    ..Default::default()
+                });
+                mesh.material.textures.insert(
+                    "emission_color".into(),
+                    TextureBinding {
+                        file: if mode == TextureMode::Virtual {
+                            root.join("no_directory/asset.<UDIM>.exr")
+                        } else {
+                            if mode == TextureMode::Compressed {
+                                root.join("asset.%(UDIM)d.exr")
+                            } else {
+                                pattern.clone()
+                            }
+                        },
+                        color_space: ColorSpace::Raw,
+                        bias: [1., 1., 1., 0.],
+                        ..Default::default()
+                    },
+                );
+                mesh.material.textures.insert(
+                    "base_color".into(),
+                    TextureBinding {
+                        file: root.join("asset.1001.exr"),
+                        color_space: ColorSpace::Raw,
+                        ..Default::default()
+                    },
+                );
+                renderer.set_scene(&scene).unwrap();
+                let pixels = renderer.render_batch(4, 0.).unwrap();
+                let handle = renderer.textures.handle(0, 30).unwrap();
+                let plain = renderer.textures.handle(0, 2).unwrap();
+                if mode == TextureMode::Virtual {
+                    assert_eq!(
+                        handle.flags,
+                        TextureHandle::UDIM | TextureHandle::VIRTUAL | TextureHandle::SOLID
+                    );
+                    assert_eq!(
+                        plain.flags,
+                        TextureHandle::PLAIN | TextureHandle::VIRTUAL | TextureHandle::SOLID
+                    );
+                    assert!(renderer.textures.resident_formats().is_empty());
+                } else {
+                    assert_eq!(handle.flags, TextureHandle::UDIM);
+                    assert_eq!(handle.tile_count, 4);
+                    assert_eq!(plain.flags, TextureHandle::PLAIN);
+                    assert_eq!(plain.tile_count, 1);
+                    assert_ne!(handle.table_offset, plain.table_offset);
+                    let formats = renderer.textures.resident_formats();
+                    assert_eq!(formats.len(), 4, "plain/UDIM shared image must deduplicate");
+                    if mode == TextureMode::Compressed {
+                        assert!(formats.contains(&(vk::Format::BC4_SNORM_BLOCK, 4)));
+                        assert!(formats.contains(&(vk::Format::BC4_UNORM_BLOCK, 4)));
+                        assert!(formats.contains(&(vk::Format::BC7_UNORM_BLOCK, 3)));
+                    }
+                }
+                for (u, v, want) in [
+                    (0, 0, [5., 1.25, 1.5]),
+                    (1, 0, [0.5; 3]),
+                    (2, 0, [0.125, 0.25, 0.375]),
+                    (0, 1, [1., 1.125, 3.]),
+                    (1, 1, [0.125, 0.25, 0.375]),
+                    (2, 1, [1.25; 3]),
+                ] {
+                    let want = if mode == TextureMode::Virtual {
+                        [0.125, 0.25, 0.375]
+                    } else {
+                        want
+                    };
+                    let pixel = &pixels[((24 - v * 16) * 48 + 8 + u * 16) * 4..][..3];
+                    assert!(
+                        pixel.iter().zip(want).all(|(a, b)| (*a - b).abs() < 0.04),
+                        "UDIM ({u},{v}) {pixel:?} vs {want:?} {mode:?} {visibility:?}"
+                    );
+                }
+                for offset in [[-1., -1.], [10., 0.]] {
+                    scene.meshes[0]
+                        .material
+                        .textures
+                        .get_mut("emission_color")
+                        .unwrap()
+                        .uv_offset = offset;
+                    renderer.set_scene(&scene).unwrap();
+                    let pixels = renderer.render_batch(4, 0.).unwrap();
+                    let pixel = &pixels[(24 * 48 + 8) * 4..][..3];
+                    assert!(
+                        pixel
+                            .iter()
+                            .zip([0.125, 0.25, 0.375])
+                            .all(|(a, b)| (*a - b).abs() < 0.001),
+                        "invalid tile coordinates alias another tile"
+                    );
+                }
+                scene.meshes[0].material.textures.clear();
+                scene.meshes[0]
+                    .material
+                    .openpbr
+                    .as_mut()
+                    .unwrap()
+                    .emission_color = [1.; 3];
+                scene.meshes[0].material.textures.insert(
+                    "geometry_opacity".into(),
+                    TextureBinding {
+                        file: if mode == TextureMode::Compressed {
+                            root.join("asset.%(UDIM)d.exr")
+                        } else {
+                            pattern.clone()
+                        },
+                        color_space: ColorSpace::Raw,
+                        channel: "r".into(),
+                        ..Default::default()
+                    },
+                );
+                renderer.set_scene(&scene).unwrap();
+                let pixels = renderer.render_batch(4, 0.).unwrap();
+                for (x, expected) in [
+                    (8, 1.),
+                    (
+                        24,
+                        if mode == TextureMode::Virtual {
+                            1.
+                        } else {
+                            0.015
+                        },
+                    ),
+                    (40, 1.),
+                ] {
+                    assert!(
+                        (pixels[(24 * 48 + x) * 4] - expected).abs() < 0.001,
+                        "UDIM opacity {mode:?} {visibility:?}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     #[ignore = "requires hardware ray queries; R32/BC4 UNORM/SNORM sampling and grayscale swizzles/mips"]
     fn grayscale_texture_gpu_formats_signed_values_and_mips() {
         use crate::integrator::VisibilityMode;
@@ -1452,6 +1719,101 @@ mod path_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    #[ignore = "requires hardware ray queries; transmission amount and RGB tint texture multipliers"]
+    fn refraction_textures_match_constant_amount_and_tint() {
+        use crate::integrator::VisibilityMode;
+        use crate::material::OpenPbrSurface;
+        use crate::texture::{ColorSpace, TextureBinding, TextureMode};
+        let root = std::env::temp_dir().join(format!("lava-refraction-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let texture = root.join("tint.exr");
+        image::Rgb32FImage::from_pixel(4, 4, image::Rgb([0.2, 0.6, 0.9]))
+            .save(&texture)
+            .unwrap();
+        fn rgb(renderer: &mut Renderer, scene: &Scene) -> [f32; 3] {
+            renderer.set_scene(scene).unwrap();
+            let mut image = Vec::new();
+            while renderer.samples() < 256 {
+                image = renderer.render_batch(256 - renderer.samples(), 0.).unwrap();
+            }
+            std::array::from_fn(|c| {
+                image.as_chunks::<4>().0.iter().map(|p| p[c]).sum::<f32>() / 64.
+            })
+        }
+        for visibility in [VisibilityMode::RayQuery, VisibilityMode::Raster] {
+            let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+            renderer.linear_output = true;
+            for mode in [TextureMode::Original, TextureMode::Compressed] {
+                let mut scene = fixture();
+                scene.settings.visibility = visibility;
+                scene.settings.textures = mode;
+                scene.settings.diffuse_depth = 0;
+                scene.settings.reflection_depth = 0;
+                scene.settings.refraction_depth = 1;
+                scene.meshes[0].texcoords = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+                scene.lights = vec![Light::Area {
+                    position: [0., 0., -1.],
+                    u: [4., 0., 0.],
+                    v: [0., 4., 0.],
+                    color: [1.; 3],
+                    intensity: 3.,
+                    single_sided: true,
+                    render_light_geometry: true,
+                }];
+                let base = OpenPbrSurface {
+                    transmission_weight: 0.6,
+                    transmission_color: [0.3, 0.5, 0.8],
+                    specular_roughness: 0.,
+                    ..Default::default()
+                };
+                let mut equivalent = base;
+                equivalent.transmission_weight *= 0.6;
+                equivalent.transmission_color = [0.3 * 0.2, 0.5 * 0.6, 0.8 * 0.9];
+                scene.meshes[0].material.openpbr = Some(equivalent);
+                let expected = rgb(&mut renderer, &scene);
+                scene.meshes[0].material.openpbr = Some(base);
+                for (field, channel, scale) in [
+                    ("transmission_weight", "g", [base.transmission_weight; 4]),
+                    ("transmission_color", "rgb", [0.3, 0.5, 0.8, 1.]),
+                ] {
+                    scene.meshes[0].material.textures.insert(
+                        field.into(),
+                        TextureBinding {
+                            file: texture.clone(),
+                            channel: channel.into(),
+                            color_space: ColorSpace::Raw,
+                            scale,
+                            ..Default::default()
+                        },
+                    );
+                }
+                let actual = rgb(&mut renderer, &scene);
+                for c in 0..3 {
+                    assert!(expected[c] > 0.01);
+                    assert!(
+                        (actual[c] - expected[c]).abs() < 0.008 + expected[c] * 0.05,
+                        "refraction {actual:?} expected {expected:?}, {visibility:?} {mode:?}"
+                    );
+                }
+                // A zero authored amount must remain opaque despite a nonzero map.
+                scene.meshes[0]
+                    .material
+                    .openpbr
+                    .as_mut()
+                    .unwrap()
+                    .transmission_weight = 0.;
+                scene.meshes[0]
+                    .material
+                    .textures
+                    .get_mut("transmission_weight")
+                    .unwrap()
+                    .scale = [0.; 4];
+                assert_eq!(rgb(&mut renderer, &scene), [0.; 3]);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     #[ignore = "requires hardware ray queries; texture channels, multipliers and normal/bump shading frames"]
     fn texture_channels_multipliers_and_shading_frames() {
         use crate::integrator::VisibilityMode;
@@ -1474,6 +1836,8 @@ mod path_tests {
         image::Rgb32FImage::from_fn(64, 4, |x, _| image::Rgb([x as f32 / 63.; 3]))
             .save(&bump)
             .unwrap();
+        std::fs::copy(&normal, root.join("normal.1001.exr")).unwrap();
+        std::fs::copy(&bump, root.join("bump.1001.exr")).unwrap();
         for visibility in [VisibilityMode::RayQuery, VisibilityMode::Raster] {
             let mut renderer = Renderer::new(16, 16, Mode::Final, None).unwrap();
             renderer.linear_output = true;
@@ -1530,6 +1894,8 @@ mod path_tests {
                     ("normal", normal.clone(), 1., true),
                     ("normal", unsigned.clone(), 1., false),
                     ("bump", bump.clone(), 15., false),
+                    ("normal", root.join("normal.<UDIM>.exr"), 1., true),
+                    ("bump", root.join("bump.<UDIM>.exr"), 15., false),
                 ] {
                     scene.meshes[0].material.textures.clear();
                     scene.meshes[0].material.textures.insert(
@@ -1561,6 +1927,97 @@ mod path_tests {
                     );
                 }
             }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; bump/normal grazing continuity and back-face frames"]
+    fn mapped_normals_remain_continuous_when_orbiting_and_work_from_behind() {
+        use crate::integrator::VisibilityMode;
+        use crate::material::OpenPbrSurface;
+        use crate::texture::{ColorSpace, TextureBinding};
+        let root = std::env::temp_dir().join(format!("lava-normal-orbit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let normal = root.join("normal.exr");
+        let bump = root.join("bump.exr");
+        image::Rgb32FImage::from_pixel(4, 4, image::Rgb([-0.8, 0., 0.6]))
+            .save(&normal)
+            .unwrap();
+        image::Rgb32FImage::from_fn(64, 4, |x, _| image::Rgb([x as f32 / 63.; 3]))
+            .save(&bump)
+            .unwrap();
+        fn camera(scene: &mut Scene, degrees: f32) {
+            let mut transform = glam::Mat4::from_rotation_y(degrees.to_radians());
+            transform.w_axis = (transform.z_axis.truncate() * 0.5).extend(1.);
+            scene.camera.transform = transform.to_cols_array();
+        }
+        for visibility in [VisibilityMode::RayQuery, VisibilityMode::Raster] {
+            let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+            renderer.linear_output = true;
+            let mut scene = fixture();
+            scene.settings.visibility = visibility;
+            scene.meshes[0].texcoords = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+            scene.meshes[0].material.openpbr = Some(OpenPbrSurface {
+                base_color: [0.8; 3],
+                specular_weight: 0.,
+                geometry_thin_walled: true,
+                ..Default::default()
+            });
+            scene.lights = vec![Light::Directional {
+                direction: [0., 0., -1.],
+                color: [1.; 3],
+                intensity: std::f32::consts::PI,
+            }];
+            for (field, file, strength, signed) in [
+                ("normal", normal.clone(), 1., true),
+                ("bump", bump.clone(), 26.25, false),
+            ] {
+                scene.meshes[0].material.textures.clear();
+                scene.meshes[0].material.textures.insert(
+                    field.into(),
+                    TextureBinding {
+                        file,
+                        strength,
+                        signed,
+                        color_space: ColorSpace::Raw,
+                        channel: if field == "bump" { "r" } else { "rgb" }.into(),
+                        ..Default::default()
+                    },
+                );
+                camera(&mut scene, 36.);
+                let a = mean(&mut renderer, &scene, 16);
+                camera(&mut scene, 38.);
+                let b = mean(&mut renderer, &scene, 16);
+                assert!(
+                    a > 0.1 && b > 0.1 && (a - b).abs() < 0.04,
+                    "orbit discontinuity in {field}: {a} -> {b}, {visibility:?}"
+                );
+            }
+            image::Rgb32FImage::from_pixel(4, 4, image::Rgb([0.6, 0., 0.8]))
+                .save(root.join("back.exr"))
+                .unwrap();
+            scene.meshes[0].material.textures.clear();
+            camera(&mut scene, 180.);
+            scene.lights = vec![Light::Directional {
+                direction: [0., 0., 1.],
+                color: [1.; 3],
+                intensity: std::f32::consts::PI,
+            }];
+            let flat = mean(&mut renderer, &scene, 16);
+            scene.meshes[0].material.textures.insert(
+                "normal".into(),
+                TextureBinding {
+                    file: root.join("back.exr"),
+                    signed: true,
+                    color_space: ColorSpace::Raw,
+                    ..Default::default()
+                },
+            );
+            let mapped = mean(&mut renderer, &scene, 16);
+            assert!(
+                flat > 0.1 && (mapped / flat - 0.8).abs() < 0.03,
+                "back-facing normal map discarded: {mapped}/{flat}, {visibility:?}"
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1834,6 +2291,237 @@ mod path_tests {
         println!("MIS={mis}, RR={rr}, reference={expected}, mixed={mixture}, mirror={reflected}, glass={transmitted}, compacted peak={peak}/256");
     }
     #[test]
+    #[ignore = "requires hardware ray queries and optional EXT mesh shaders; analytic curves in both visibility paths"]
+    fn curves_render_round_surfaces_in_query_and_mesh_visibility() {
+        let mut scene = fixture();
+        scene.meshes.clear();
+        scene.lights.clear();
+        scene.curves.push(crate::curves::Curves {
+            points: vec![[0., -1., 0.], [0., 1., 0.]],
+            counts: vec![2],
+            basis: "linear".into(),
+            periodic: false,
+            radius: vec![0.1, 0.2],
+            radius_interpolation: "vertex".into(),
+            subdivisions: 8,
+            color: [0.5; 3],
+            material: Material {
+                openpbr: Some(crate::material::OpenPbrSurface {
+                    base_weight: 0.,
+                    specular_weight: 0.,
+                    emission_luminance: 2.,
+                    emission_color: [1., 0.5, 0.25],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        let mut query_dof: Option<f32> = None;
+        for visibility in [
+            crate::integrator::VisibilityMode::RayQuery,
+            crate::integrator::VisibilityMode::Raster,
+        ] {
+            scene.settings.visibility = visibility;
+            let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+            renderer.linear_output = true;
+            renderer.coherent_camera_reference = true;
+            let result = mean(&mut renderer, &scene, 4);
+            assert!(
+                (result - 2.).abs() < 1e-4,
+                "curve missing: {result}, {visibility:?}"
+            );
+            scene.camera.f_stop = 0.5;
+            scene.camera.focus_distance = 1.;
+            let blurred = mean(&mut renderer, &scene, 16);
+            assert!(
+                blurred > 0.1 && blurred < 1.9,
+                "curve depth of field missing: {blurred}"
+            );
+            if let Some(reference) = query_dof {
+                assert!(
+                    (blurred - reference).abs() < 0.01,
+                    "curve raster/query DOF differ: {blurred}/{reference}"
+                );
+            } else {
+                query_dof = Some(blurred);
+            }
+            scene.camera.f_stop = 0.;
+            scene.camera.transform =
+                glam::Mat4::from_translation(glam::Vec3::new(2., 0., 0.5)).to_cols_array();
+            let outside = mean(&mut renderer, &scene, 4);
+            assert!(
+                outside < 0.02,
+                "curve AABB accepted as a surface: {outside}"
+            );
+            scene.camera.transform =
+                glam::Mat4::from_translation(glam::Vec3::new(0., 0., 0.5)).to_cols_array();
+        }
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; curve shadows and secondary analytic intersections"]
+    fn curves_cast_shadows_and_remain_visible_to_secondary_rays_outside_camera_frustum() {
+        for visibility in [
+            crate::integrator::VisibilityMode::RayQuery,
+            crate::integrator::VisibilityMode::Raster,
+        ] {
+            let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+            renderer.linear_output = true;
+            let mut scene = fixture();
+            scene.settings.visibility = visibility;
+            scene.lights = vec![Light::Point {
+                position: [0., 0., 2.],
+                color: [1.; 3],
+                intensity: 4. * std::f32::consts::PI,
+            }];
+            let clear = mean(&mut renderer, &scene, 16);
+            assert!(clear > 0.7);
+            let curve:crate::curves::Curves=serde_json::from_value(serde_json::json!({"points":[[0.,-1.,1.],[0.,1.,1.]],"counts":[2],"radius":[0.01,0.2]})).unwrap();
+            scene.curves.push(curve);
+            let blocked = mean(&mut renderer, &scene, 16);
+            assert!(
+                blocked < clear * 0.1,
+                "procedural curve shadow missing: {blocked}/{clear}"
+            );
+            for p in &mut scene.curves[0].points {
+                p[0] = 0.15;
+            }
+            let empty_box = mean(&mut renderer, &scene, 16);
+            assert!(
+                (empty_box - clear).abs() < 0.025,
+                "AABB falsely shadowed tapered curve: {empty_box}/{clear}"
+            );
+            for p in &mut scene.curves[0].points {
+                p[0] = 0.;
+            }
+            scene.meshes[0].material.metallic = 1.;
+            scene.meshes[0].color = [1.; 3];
+            scene.settings.reflection_depth = 1;
+            scene.curves[0].material.openpbr = Some(crate::material::OpenPbrSurface {
+                base_weight: 0.,
+                specular_weight: 0.,
+                emission_luminance: 2.,
+                emission_color: [1., 0.5, 0.25],
+                ..Default::default()
+            });
+            scene.lights.clear();
+            let reflected = mean(&mut renderer, &scene, 4);
+            assert!(
+                (reflected - 2.).abs() < 1e-4,
+                "curve behind camera vanished from reflection: {reflected}"
+            );
+        }
+    }
+    #[test]
+    #[ignore = "requires EXT mesh shaders; subpixel curve culling is viewport-only"]
+    fn curve_subpixel_culling_is_interactive_only() {
+        let mut scene = fixture();
+        scene.meshes.clear();
+        scene.lights.clear();
+        scene.settings.visibility = crate::integrator::VisibilityMode::Raster;
+        scene.curves.push(serde_json::from_value(serde_json::json!({"points":[[0.,-1.,0.],[0.,1.,0.]],"counts":[2],"radius":0.000001,"material":{"openpbr":{"base_weight":0.,"specular_weight":0.,"emission_luminance":2.,"emission_color":[1.,1.,1.]}}})).unwrap());
+        let mut viewport = Renderer::new(1, 1, Mode::Interactive, None).unwrap();
+        viewport.linear_output = true;
+        if !viewport.device.mesh_shader {
+            return;
+        }
+        let culled = mean(&mut viewport, &scene, 256);
+        let mut final_frame = Renderer::new(1, 1, Mode::Final, None).unwrap();
+        final_frame.linear_output = true;
+        let retained = mean(&mut final_frame, &scene, 256);
+        assert!(
+            culled < 0.02 && retained > culled + 0.01,
+            "viewport LOD {culled}, final thin strand {retained}"
+        );
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; analytic reflection clamping and accumulation reset"]
+    fn analytic_reflection_clamping_is_opt_in_and_preserves_diffuse() {
+        use crate::material::OpenPbrSurface;
+        let mut renderer = Renderer::new(8, 8, Mode::Interactive, None).unwrap();
+        renderer.linear_output = true;
+        let mut scene = fixture();
+        scene.settings.reflection_depth = 1;
+        scene.meshes[0].material.openpbr = Some(OpenPbrSurface {
+            base_weight: 0.,
+            specular_roughness: 0.01,
+            ..Default::default()
+        });
+        for light in [
+            Light::Directional {
+                direction: [0., 0., -1.],
+                color: [1.; 3],
+                intensity: 1.,
+            },
+            Light::Point {
+                position: [0., 0., 1.],
+                color: [1.; 3],
+                intensity: 1.,
+            },
+            Light::Spot {
+                position: [0., 0., 1.],
+                direction: [0., 0., -1.],
+                color: [1.; 3],
+                intensity: 1.,
+                cone_degrees: 45.,
+                softness: 0.,
+            },
+        ] {
+            scene.lights = vec![light];
+            scene.settings.reduce_analytic_caustics = false;
+            let reference = mean(&mut renderer, &scene, 4);
+            let tlas = renderer.tlas.as_ref().unwrap().raw;
+            scene.settings.reduce_analytic_caustics = true;
+            renderer.update_scene_parameters(&scene).unwrap();
+            assert_eq!(renderer.samples(), 0);
+            assert_eq!(renderer.tlas.as_ref().unwrap().raw, tlas);
+            let mut image = Vec::new();
+            while renderer.samples() < 4 {
+                image = renderer.render_batch(4 - renderer.samples(), 0.).unwrap();
+            }
+            let limited = image.as_chunks::<4>().0.iter().map(|p| p[0]).sum::<f32>() / 64.;
+            assert!(
+                reference > 160.,
+                "expected sharp analytic reflection: {reference}"
+            );
+            assert!(
+                limited > 0. && limited <= 16.01 && limited < reference * 0.1,
+                "reference={reference}, limited={limited}"
+            );
+        }
+        scene.meshes[0].material.openpbr = Some(OpenPbrSurface {
+            specular_weight: 0.,
+            ..Default::default()
+        });
+        scene.settings.reduce_analytic_caustics = false;
+        let diffuse = mean(&mut renderer, &scene, 16);
+        scene.settings.reduce_analytic_caustics = true;
+        assert!((mean(&mut renderer, &scene, 16) - diffuse).abs() < 1e-5);
+        scene.lights.clear();
+        scene.meshes[0].material.openpbr = Some(OpenPbrSurface {
+            emission_luminance: 100.,
+            emission_color: [1.; 3],
+            ..Default::default()
+        });
+        scene.settings.reduce_analytic_caustics = false;
+        let emission = mean(&mut renderer, &scene, 4);
+        scene.settings.reduce_analytic_caustics = true;
+        assert!(emission >= 100.);
+        assert!((mean(&mut renderer, &scene, 4) - emission).abs() < 1e-4);
+        // A bright emitter reflected in an ordinary mirror must not be capped
+        // merely because its incident radiance exceeds the multiplier bound.
+        scene = fixture();
+        scene.settings.reflection_depth = 1;
+        scene.meshes[0].material.metallic = 1.;
+        scene.meshes[0].color = [1.; 3];
+        if let Light::Area { intensity, .. } = &mut scene.lights[0] {
+            *intensity = 100.;
+        }
+        let mirror = mean(&mut renderer, &scene, 4);
+        scene.settings.reduce_analytic_caustics = true;
+        assert!((mean(&mut renderer, &scene, 4) - mirror).abs() < 1e-4);
+        assert!((mirror - 100.).abs() < 1e-4);
+    }
+    #[test]
     #[ignore = "requires hardware ray queries; OpenPBR energy, lobes, coverage, emission and depth tests"]
     fn openpbr_surface_energy_lobes_and_updates() {
         use crate::material::OpenPbrSurface;
@@ -1931,6 +2619,91 @@ mod path_tests {
             "stochastic coverage energy: {cutout}"
         );
         println!("OpenPBR Lambert={diffuse}, RR={rr}, smooth={smooth}, rough={rough}, layered={layered}, glass={glass}, emission={emission}, clear={clear}");
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; smooth polygon shadow terminator and retained occluders"]
+    fn smooth_polygon_lighting_point_fixes_terminator_without_flat_mesh_leaks() {
+        use crate::integrator::VisibilityMode;
+        for visibility in [VisibilityMode::RayQuery, VisibilityMode::Raster] {
+            for native in [false, true] {
+                let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+                renderer.linear_output = true;
+                let mut scene = fixture();
+                scene.settings.visibility = visibility;
+                scene.camera.transform =
+                    glam::Mat4::from_translation(glam::Vec3::new(0.5, 0., 0.5)).to_cols_array();
+                let mesh = &mut scene.meshes[0];
+                mesh.points = vec![[-1., -1., 0.], [1., -1., 0.], [1., 1., 0.], [-1., 1., 0.]];
+                if native {
+                    mesh.material.openpbr = Some(crate::material::OpenPbrSurface {
+                        base_color: [0.8; 3],
+                        specular_weight: 0.,
+                        ..Default::default()
+                    });
+                }
+                scene.lights = vec![Light::Directional {
+                    direction: [-1., 0., 0.15],
+                    color: [1.; 3],
+                    intensity: 2. * std::f32::consts::PI,
+                }];
+                let flat = mean(&mut renderer, &scene, 128);
+                assert!(
+                    flat < 0.025,
+                    "flat geometry leaked light from below: {flat}"
+                );
+                // A coarse convex cylindrical patch, with smooth vertex normals.
+                scene.meshes[0].normals = vec![
+                    [-0.6, 0., 0.8],
+                    [0.6, 0., 0.8],
+                    [0.6, 0., 0.8],
+                    [-0.6, 0., 0.8],
+                ];
+                let smooth = mean(&mut renderer, &scene, 128);
+                assert!(smooth>0.25,"coarse smooth polygon still has a hard terminator: {smooth}, {visibility:?}, native={native}");
+                let mut blocker = scene.meshes[0].clone();
+                blocker.points = vec![
+                    [2., -10., -10.],
+                    [2., 10., -10.],
+                    [2., 10., 10.],
+                    [2., -10., 10.],
+                ];
+                blocker.normals.clear();
+                scene.meshes.push(blocker);
+                let shadow = mean(&mut renderer, &scene, 128);
+                assert!(
+                    shadow < smooth * 0.1,
+                    "real occluder was lost: {shadow}/{smooth}"
+                );
+                scene.meshes.pop();
+                scene.meshes[0].normals = vec![[0.6, 0., 0.8]; 4];
+                let constant = mean(&mut renderer, &scene, 128);
+                assert!(
+                    constant < 0.025,
+                    "constant tilted normals displaced a flat plane: {constant}"
+                );
+                // Keep true boundary crossing for glass, even with curved normals.
+                scene.meshes[0].normals = vec![
+                    [-0.6, 0., 0.8],
+                    [0.6, 0., 0.8],
+                    [0.6, 0., 0.8],
+                    [-0.6, 0., 0.8],
+                ];
+                if native {
+                    scene.meshes[0]
+                        .material
+                        .openpbr
+                        .as_mut()
+                        .unwrap()
+                        .transmission_weight = 1.;
+                } else {
+                    scene.meshes[0].material.transmission = 1.;
+                }
+                assert!(
+                    mean(&mut renderer, &scene, 128) < 0.025,
+                    "transmissive boundary was displaced"
+                );
+            }
+        }
     }
     #[test]
     #[ignore = "requires hardware ray queries; area-light shadow endpoints at grazing angles"]

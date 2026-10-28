@@ -122,6 +122,7 @@ pub(crate) struct RasterVisibility {
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     pipeline: vk::Pipeline,
+    curve_pipeline: vk::Pipeline,
     pub resolve: vk::Pipeline,
     width: u32,
     height: u32,
@@ -141,6 +142,7 @@ impl RasterVisibility {
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
             pipeline: vk::Pipeline::null(),
+            curve_pipeline: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
             width,
             height,
@@ -230,7 +232,7 @@ impl RasterVisibility {
                     .layers(1),
                 None,
             )?;
-            let binaries: [(&[u8], vk::ShaderStageFlags); 2] = [
+            let triangle_binaries: Vec<(&[u8], vk::ShaderStageFlags)> = vec![
                 (
                     include_bytes!(concat!(env!("OUT_DIR"), "/visibility_raster.vert.spv")),
                     vk::ShaderStageFlags::VERTEX,
@@ -240,62 +242,79 @@ impl RasterVisibility {
                     vk::ShaderStageFlags::FRAGMENT,
                 ),
             ];
-            let mut modules = Vec::new();
-            let result = (|| -> Result<vk::Pipeline> {
-                for (bytes, _) in &binaries {
-                    let code = ash::util::read_spv(&mut std::io::Cursor::new(bytes))?;
-                    modules.push(r.device.raw.create_shader_module(
-                        &vk::ShaderModuleCreateInfo::default().code(&code),
-                        None,
-                    )?);
-                }
-                let stages: Vec<_> = binaries
-                    .iter()
-                    .zip(&modules)
-                    .map(|((_, stage), module)| {
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(*stage)
-                            .module(*module)
-                            .name(c"main")
-                    })
-                    .collect();
-                let vertex = vk::PipelineVertexInputStateCreateInfo::default();
-                let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-                let viewport = [vk::Viewport::default()
-                    .width(width as f32)
-                    .height(height as f32)
-                    .min_depth(0.)
-                    .max_depth(1.)];
-                let scissors = [vk::Rect2D::default().extent(vk::Extent2D { width, height })];
-                let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-                let dynamic =
-                    vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-                let vp = vk::PipelineViewportStateCreateInfo::default()
-                    .viewports(&viewport)
-                    .scissors(&scissors);
-                let raster = vk::PipelineRasterizationStateCreateInfo::default()
-                    .polygon_mode(vk::PolygonMode::FILL)
-                    .cull_mode(vk::CullModeFlags::NONE)
-                    .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                    .line_width(1.);
-                let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                    .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-                let depth = vk::PipelineDepthStencilStateCreateInfo::default()
-                    .depth_test_enable(true)
-                    .depth_write_enable(true)
-                    .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
-                let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::RGBA);
-                    2];
-                let blend = vk::PipelineColorBlendStateCreateInfo::default()
-                    .attachments(&blend_attachments);
-                match r.device.raw.create_graphics_pipelines(
-                    cache,
-                    &[vk::GraphicsPipelineCreateInfo::default()
+            let mut binary_sets = vec![(false, triangle_binaries)];
+            if r.device.mesh_shader {
+                binary_sets.push((
+                    true,
+                    vec![
+                        (
+                            include_bytes!(concat!(env!("OUT_DIR"), "/curves.task.spv")),
+                            vk::ShaderStageFlags::TASK_EXT,
+                        ),
+                        (
+                            include_bytes!(concat!(env!("OUT_DIR"), "/curves.mesh.spv")),
+                            vk::ShaderStageFlags::MESH_EXT,
+                        ),
+                        (
+                            include_bytes!(concat!(env!("OUT_DIR"), "/curves.frag.spv")),
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                    ],
+                ));
+            }
+            for (curve, binaries) in binary_sets {
+                let mut modules = Vec::new();
+                let result = (|| -> Result<vk::Pipeline> {
+                    for (bytes, _) in &binaries {
+                        let code = ash::util::read_spv(&mut std::io::Cursor::new(bytes))?;
+                        modules.push(r.device.raw.create_shader_module(
+                            &vk::ShaderModuleCreateInfo::default().code(&code),
+                            None,
+                        )?);
+                    }
+                    let stages: Vec<_> = binaries
+                        .iter()
+                        .zip(&modules)
+                        .map(|((_, stage), module)| {
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(*stage)
+                                .module(*module)
+                                .name(c"main")
+                        })
+                        .collect();
+                    let vertex = vk::PipelineVertexInputStateCreateInfo::default();
+                    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+                    let viewport = [vk::Viewport::default()
+                        .width(width as f32)
+                        .height(height as f32)
+                        .min_depth(0.)
+                        .max_depth(1.)];
+                    let scissors = [vk::Rect2D::default().extent(vk::Extent2D { width, height })];
+                    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+                    let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+                        .dynamic_states(&dynamic_states);
+                    let vp = vk::PipelineViewportStateCreateInfo::default()
+                        .viewports(&viewport)
+                        .scissors(&scissors);
+                    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+                        .polygon_mode(vk::PolygonMode::FILL)
+                        .cull_mode(vk::CullModeFlags::NONE)
+                        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                        .line_width(1.);
+                    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+                    let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+                        .depth_test_enable(true)
+                        .depth_write_enable(true)
+                        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+                    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+                        .color_write_mask(vk::ColorComponentFlags::RGBA);
+                        2];
+                    let blend = vk::PipelineColorBlendStateCreateInfo::default()
+                        .attachments(&blend_attachments);
+                    let mut info = vk::GraphicsPipelineCreateInfo::default()
                         .stages(&stages)
-                        .vertex_input_state(&vertex)
-                        .input_assembly_state(&assembly)
                         .viewport_state(&vp)
                         .dynamic_state(&dynamic)
                         .rasterization_state(&raster)
@@ -303,22 +322,31 @@ impl RasterVisibility {
                         .depth_stencil_state(&depth)
                         .color_blend_state(&blend)
                         .layout(layout)
-                        .render_pass(r.render_pass)],
-                    None,
-                ) {
-                    Ok(p) => Ok(p[0]),
-                    Err((partial, e)) => {
-                        for p in partial {
-                            r.device.raw.destroy_pipeline(p, None);
-                        }
-                        Err(e.into())
+                        .render_pass(r.render_pass);
+                    if !curve {
+                        info = info
+                            .vertex_input_state(&vertex)
+                            .input_assembly_state(&assembly);
                     }
+                    match r.device.raw.create_graphics_pipelines(cache, &[info], None) {
+                        Ok(p) => Ok(p[0]),
+                        Err((partial, e)) => {
+                            for p in partial {
+                                r.device.raw.destroy_pipeline(p, None);
+                            }
+                            Err(e.into())
+                        }
+                    }
+                })();
+                for module in modules {
+                    r.device.raw.destroy_shader_module(module, None);
                 }
-            })();
-            for module in modules {
-                r.device.raw.destroy_shader_module(module, None);
+                if curve {
+                    r.curve_pipeline = result?;
+                } else {
+                    r.pipeline = result?;
+                }
             }
-            r.pipeline = result?;
             let code = ash::util::read_spv(&mut std::io::Cursor::new(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/visibility_resolve.spv"
@@ -410,6 +438,7 @@ impl RasterVisibility {
         layout: vk::PipelineLayout,
         set: vk::DescriptorSet,
         vertices: u32,
+        curves: u32,
     ) {
         let clear = [
             vk::ClearValue {
@@ -466,6 +495,17 @@ impl RasterVisibility {
             &[],
         );
         self.device.raw.cmd_draw(cmd, vertices, 1, 0, 0);
+        if curves > 0 && self.device.mesh_shader {
+            self.device.raw.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.curve_pipeline,
+            );
+            let groups = curves.div_ceil(32);
+            let x = groups.min(65535);
+            ash::ext::mesh_shader::Device::new(&self.device.instance.raw, &self.device.raw)
+                .cmd_draw_mesh_tasks(cmd, x, groups.div_ceil(x), 1);
+        }
         self.device.raw.cmd_end_render_pass(cmd);
     }
 }
@@ -473,6 +513,7 @@ impl Drop for RasterVisibility {
     fn drop(&mut self) {
         unsafe {
             self.device.raw.destroy_pipeline(self.pipeline, None);
+            self.device.raw.destroy_pipeline(self.curve_pipeline, None);
             self.device.raw.destroy_pipeline(self.resolve, None);
             self.device.raw.destroy_framebuffer(self.framebuffer, None);
             self.device.raw.destroy_render_pass(self.render_pass, None);

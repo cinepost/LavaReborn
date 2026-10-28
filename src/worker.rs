@@ -149,7 +149,9 @@ impl Worker {
                             if Arc::ptr_eq(&current.as_ref().unwrap().1.scene, &r.scene)
                                 || current.as_ref().unwrap().1.scene.same_geometry(&r.scene)
                             {
-                                if current.as_ref().unwrap().1.scene.meshes != r.scene.meshes {
+                                if current.as_ref().unwrap().1.scene.meshes != r.scene.meshes
+                                    || current.as_ref().unwrap().1.scene.curves != r.scene.curves
+                                {
                                     renderer.update_materials(&r.scene)?;
                                 }
                                 renderer.gpu_output = r.gpu_output;
@@ -353,6 +355,110 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires hardware ray queries; asynchronous UDIM tile add/edit/remove in a converged viewport"]
+    fn udim_tiles_hot_reload_without_scene_edits_or_image_roundtrip() {
+        use crate::texture::{ColorSpace, TextureBinding, TextureMode};
+        let root = std::env::temp_dir().join(format!("lava-udim-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |number, color| {
+            image::RgbaImage::from_pixel(8, 4, image::Rgba(color))
+                .save(root.join(format!("asset.{number}.png")))
+                .unwrap();
+        };
+        write(1001, [255u8, 0, 0, 255]);
+        let mut scene: Scene =
+            serde_json::from_str(include_str!("../examples/studio.json")).unwrap();
+        scene.meshes.truncate(1);
+        scene.lights.clear();
+        scene.camera.transform =
+            glam::Mat4::from_translation(glam::Vec3::new(0., 0., 0.5)).to_cols_array();
+        scene.camera.orthographic = true;
+        scene.camera.horizontal_aperture = 2.;
+        scene.camera.vertical_aperture = 2.;
+        scene.settings.textures = TextureMode::Compressed;
+        scene.settings.diffuse_depth = 0;
+        scene.settings.reflection_depth = 0;
+        scene.settings.refraction_depth = 0;
+        scene.meshes[0].points = vec![[-2., -2., 0.], [2., -2., 0.], [2., 2., 0.], [-2., 2., 0.]];
+        scene.meshes[0].texcoords = vec![[1., 0.], [2., 0.], [2., 1.], [1., 1.]];
+        scene.meshes[0].material.openpbr = Some(crate::material::OpenPbrSurface {
+            base_weight: 0.,
+            specular_weight: 0.,
+            emission_luminance: 1.,
+            emission_color: [0.2, 0.3, 0.4],
+            ..Default::default()
+        });
+        scene.meshes[0].material.textures.insert(
+            "emission_color".into(),
+            TextureBinding {
+                file: root.join("asset.<UDIM>.png"),
+                color_space: ColorSpace::Raw,
+                ..Default::default()
+            },
+        );
+        let worker = Worker::new();
+        let request = Request {
+            scene: Arc::new(scene),
+            view: None,
+            width: 16,
+            height: 16,
+            mode: Mode::Interactive,
+            samples: 4,
+            exposure: 0.,
+            gpu_output: true,
+        };
+        let revision = worker.submit(request).unwrap();
+        let mut previous = wait(&worker, revision, false, 4);
+        let p = previous.read_color().unwrap();
+        assert!(p[..3]
+            .iter()
+            .zip([0.2, 0.3, 0.4])
+            .all(|(a, b)| (*a - b).abs() < 0.01));
+        for (step, want) in [(0, [0., 1., 0.]), (1, [0.5; 3]), (2, [0.2, 0.3, 0.4])] {
+            let readbacks = crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed);
+            match step {
+                0 => write(1002, [0, 255, 0, 255]),
+                1 => write(1002, [128, 128, 128, 255]),
+                _ => std::fs::remove_file(root.join("asset.1002.png")).unwrap(),
+            };
+            let until = Instant::now() + Duration::from_secs(30);
+            let frame = loop {
+                assert!(worker.error.lock().unwrap().is_none());
+                let f = worker.frame.lock().unwrap();
+                if let Some(f) = f.as_ref() {
+                    if !f.pending_scene
+                        && f.samples >= 4
+                        && f.gpu.as_ref().unwrap().serial > previous.serial
+                    {
+                        break f.gpu.clone().unwrap();
+                    }
+                }
+                drop(f);
+                assert!(
+                    Instant::now() < until,
+                    "UDIM tile change was not discovered"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed),
+                readbacks
+            );
+            let pixels = frame.read_color().unwrap();
+            assert!(
+                pixels[..3]
+                    .iter()
+                    .zip(want)
+                    .all(|(a, b)| (*a - b).abs() < 0.015),
+                "UDIM update {step} failed: {:?}",
+                &pixels[..3]
+            );
+            previous = frame;
+        }
+        drop(worker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     #[ignore = "requires hardware ray queries; resize during blocked scene builds must reuse device and keep presenting"]
     fn resize_keeps_scene_device_and_does_not_join_pending_builds() {

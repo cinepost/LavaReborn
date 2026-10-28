@@ -1,5 +1,6 @@
 #pragma once
 #include "meshNormals.h"
+#include "texturePaths.h"
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/shader.h>
 
@@ -7,8 +8,8 @@ PXR_NAMESPACE_OPEN_SCOPE
 namespace lava {
 // Recover authored Principled inputs that Houdini's auto-preview loses (notably
 // monoChannel and bump parameters). Read only; never modify the source stage.
-inline UsdPrim PrincipledSource(HdSceneDelegate *delegate, SdfPath const &id,
-                                UsdTimeCode *time = nullptr) {
+inline UsdPrim MaterialSource(HdSceneDelegate *delegate, SdfPath const &id,
+                              UsdTimeCode *time = nullptr) {
   auto *imaging = dynamic_cast<UsdImagingDelegate *>(delegate);
   if (!imaging) {
     for (auto const &rprim : delegate->GetRenderIndex().GetRprimIds()) {
@@ -25,7 +26,11 @@ inline UsdPrim PrincipledSource(HdSceneDelegate *delegate, SdfPath const &id,
   if (time)
     *time = imaging->GetTime();
   MeshSourceReader reader;
-  auto material = reader.Source(imaging, id);
+  return reader.Source(imaging, id);
+}
+inline UsdPrim PrincipledSource(HdSceneDelegate *delegate, SdfPath const &id,
+                                UsdTimeCode *time = nullptr) {
+  auto material = MaterialSource(delegate, id, time);
   if (!material)
     return {};
   SdfPathVector paths;
@@ -66,6 +71,8 @@ PrincipledNetwork(HdMaterialNetwork network, HdMaterialNode const &terminal,
       return v.UncheckedGet<float>();
     if (v.IsHolding<int>())
       return float(v.UncheckedGet<int>());
+    if (v.IsHolding<bool>())
+      return v.UncheckedGet<bool>() ? 1.f : 0.f;
     return fallback;
   };
   auto text = [&](char const *name, std::string fallback) {
@@ -93,13 +100,23 @@ PrincipledNetwork(HdMaterialNetwork network, HdMaterialNode const &terminal,
     if (!asset.IsHolding<SdfAssetPath>() ||
         asset.UncheckedGet<SdfAssetPath>().GetAssetPath().empty())
       return;
+    auto sourcePath =
+        ExpandTexturePath(asset.UncheckedGet<SdfAssetPath>().GetAssetPath());
+    if (sourcePath.find("<UDIM>") != std::string::npos)
+      asset = VtValue(SdfAssetPath(
+          AnchorUdim(prim.GetAttribute(TfToken(std::string("inputs:") + file)),
+                     sourcePath, time)));
+    else if (sourcePath != asset.UncheckedGet<SdfAssetPath>().GetAssetPath())
+      asset = VtValue(SdfAssetPath(sourcePath));
     HdMaterialNode image;
     image.path =
         terminal.path.AppendChild(TfToken(std::string("lava_") + field));
     image.identifier = TfToken("UsdUVTexture");
     image.parameters[TfToken("file")] = asset;
-    auto colorspace =
-        text(space, std::string(field) == "diffuseColor" ? "auto" : "raw");
+    auto colorspace = text(space, (std::string(field) == "diffuseColor" ||
+                                   std::string(field) == "transmissionColor")
+                                      ? "auto"
+                                      : "raw");
     if (colorspace == "linear")
       colorspace = "raw";
     image.parameters[TfToken("sourceColorSpace")] =
@@ -133,6 +150,27 @@ PrincipledNetwork(HdMaterialNetwork network, HdMaterialNode const &terminal,
         (name + "_textureWrap").c_str(), (name + "_textureColorSpace").c_str(),
         GfVec4f(multiplier), GfVec4f(0), channels[std::clamp(channel, 0, 3)],
         1);
+  }
+  // Refraction is a BSDF lobe, independent of stochastic opacity/coverage.
+  // Replace any auto-preview binding, including when the toggle is disabled.
+  remove("transmission");
+  remove("transmissionColor");
+  remove("opacity"); // Auto-preview folds refraction into coverage.
+  if (scalar("transparency_useTexture", 0) != 0) {
+    const char *channels[] = {"luminance", "r", "g", "b"};
+    int channel = std::clamp(int(scalar("transparency_monoChannel", 0)), 0, 3);
+    add("transmission", "transparency_texture", "transparency_textureWrap",
+        "transparency_textureColorSpace", GfVec4f(scalar("transparency", 0)),
+        GfVec4f(0), channels[channel], 1);
+  }
+  if (scalar("transcolor_useTexture", 0) != 0) {
+    auto value = PrincipledValue(prim, "transcolor", time);
+    GfVec3f color(1.f);
+    if (value.IsHolding<GfVec3f>())
+      color = value.UncheckedGet<GfVec3f>();
+    add("transmissionColor", "transcolor_texture", "transcolor_textureWrap",
+        "transcolor_textureColorSpace",
+        GfVec4f(color[0], color[1], color[2], 1), GfVec4f(0), "rgb", 1);
   }
   if (scalar("baseBumpAndNormal_enable", 0) != 0) {
     remove("normal");

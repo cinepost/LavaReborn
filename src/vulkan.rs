@@ -76,6 +76,7 @@ pub struct Device {
     pub queue_family: u32,
     pub interop: bool,
     pub uuid: [u8; 16],
+    pub mesh_shader: bool,
     submit_lock: std::sync::Mutex<()>,
 }
 impl Device {
@@ -153,6 +154,40 @@ impl Device {
                 .external_semaphore_features
                 .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE);
             let mut names: Vec<_> = EXTENSIONS.iter().map(|x| x.as_ptr()).collect();
+            let mut mesh_supported = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+            instance.raw.get_physical_device_features2(
+                selected.device,
+                &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut mesh_supported),
+            );
+            let mut mesh_props = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+            instance.raw.get_physical_device_properties2(
+                selected.device,
+                &mut vk::PhysicalDeviceProperties2::default().push_next(&mut mesh_props),
+            );
+            let mesh_shader = available
+                .iter()
+                .any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == ash::ext::mesh_shader::NAME)
+                && mesh_supported.mesh_shader != 0
+                && mesh_supported.task_shader != 0
+                && mesh_props.max_mesh_output_vertices >= 16
+                && mesh_props.max_mesh_output_primitives >= 28
+                && mesh_props.max_task_work_group_invocations >= 32
+                && mesh_props.max_mesh_work_group_invocations >= 32;
+            #[cfg(test)]
+            let mesh_shader =
+                mesh_shader && std::env::var_os("LAVA_TEST_DISABLE_MESH_SHADERS").is_none();
+            if mesh_shader {
+                names.push(ash::ext::mesh_shader::NAME.as_ptr());
+            }
+            eprintln!(
+                "Lava: {}: hardware ray queries; mesh/task shaders {}",
+                selected.name,
+                if mesh_shader {
+                    "enabled"
+                } else {
+                    "unavailable (curve visibility uses ray queries)"
+                }
+            );
             if interop {
                 names.extend(optional.iter().map(|n| n.as_ptr()));
             }
@@ -181,6 +216,11 @@ impl Device {
                         >= crate::texture::MAX_TEXTURES as u32,
                 "GPU has insufficient sampled texture descriptors"
             );
+            ensure!(
+                limits.max_per_stage_descriptor_storage_buffers >= 16
+                    && limits.max_descriptor_set_storage_buffers >= 16,
+                "texture tile indirection requires 16 storage buffer descriptors"
+            );
             let features = vk::PhysicalDeviceFeatures::default()
                 .texture_compression_bc(base_features.texture_compression_bc != 0)
                 .shader_sampled_image_array_dynamic_indexing(
@@ -193,7 +233,10 @@ impl Device {
                 .acceleration_structure(true);
             let mut address = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                 .buffer_device_address(true);
-            let info = vk::DeviceCreateInfo::default()
+            let mut mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .mesh_shader(true)
+                .task_shader(true);
+            let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .enabled_extension_names(&names)
                 .enabled_features(&features)
@@ -201,6 +244,9 @@ impl Device {
                 .push_next(&mut ray)
                 .push_next(&mut accel_features)
                 .push_next(&mut address);
+            if mesh_shader {
+                info = info.push_next(&mut mesh_features);
+            }
             let raw = instance
                 .raw
                 .create_device(selected.device, &info, None)
@@ -228,6 +274,7 @@ impl Device {
                 queue_family: selected.queue,
                 interop,
                 uuid: id.device_uuid,
+                mesh_shader,
                 queue: raw.get_device_queue(selected.queue, 0),
                 raw,
                 accel,
@@ -239,6 +286,16 @@ impl Device {
         }
     }
     /// Command-pool and queue access are serialized across submissions.
+    pub fn shader_stages(&self) -> vk::ShaderStageFlags {
+        let stages = vk::ShaderStageFlags::COMPUTE
+            | vk::ShaderStageFlags::VERTEX
+            | vk::ShaderStageFlags::FRAGMENT;
+        if self.mesh_shader {
+            stages | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
+        } else {
+            stages
+        }
+    }
     pub fn submit(&self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
         self.submit_signal(vk::Semaphore::null(), record)
     }

@@ -1,27 +1,15 @@
 #ifndef LAVA_MATERIAL_TEXTURES
 #define LAVA_MATERIAL_TEXTURES
-#extension GL_EXT_nonuniform_qualifier : require
+#include "../textures.glsl"
 #include "record.glsl"
-struct TextureSlot {uvec4 info;vec4 scale;vec4 bias;vec4 uv;vec4 rangeScale;vec4 rangeBias;vec4 parameters;};
-layout(set=0,binding=18) uniform sampler2D materialTextures[128];
+struct TextureSlot {TextureHandle handle;uvec4 info;vec4 scale;vec4 bias;vec4 uv;vec4 parameters;};
 layout(std430,set=0,binding=19) readonly buffer TextureSlots {TextureSlot textureSlots[];};
 vec4 materialValue(uint id,uint field,vec2 uv,float footprint) {
  TextureSlot slot=textureSlots[id*40u+field];
- if(slot.info.x==0u)return field<38u?materials[id].values[field]:vec4(0);
- uint index=slot.info.x;
- uv=uv*slot.uv.xy+slot.uv.zw;
- ivec2 size=textureSize(materialTextures[nonuniformEXT(index)],0);
- for(uint c=0u;c<2u;c++) {
-  uint mode=slot.info[2u+c];
-  if(mode==3u&&(uv[c]<0.||uv[c]>1.))return slot.bias;
-  if(mode==1u)uv[c]=clamp(uv[c],.5/float(size[c]),1.-.5/float(size[c]));
-  if(mode==2u)uv[c]=1.-abs(mod(uv[c],2.)-1.);
- }
- // USD st coordinates are bottom-up; decoded image rows are top-down.
- uv.y=1.-uv.y;
- float texels=max(float(size.x)*abs(slot.uv.x),float(size.y)*abs(slot.uv.y));
- float lod=max(0.,log2(max(footprint*texels,1.)));
- vec4 value=textureLod(materialTextures[nonuniformEXT(index)],uv,lod)*slot.rangeScale+slot.rangeBias;
+ vec4 fallback=field<38u?materials[id].values[field]:vec4(0);
+ if(slot.info.x==0u)return fallback;
+ vec4 value;
+ if(!textureSample(slot.handle,uv*slot.uv.xy+slot.uv.zw,footprint*abs(slot.uv.xy),slot.info.zw,value))return fallback;
  value=value*slot.scale+slot.bias;
  if(slot.info.y<4u)value=vec4(value[slot.info.y]);
  if(slot.info.y==5u)value=vec4(dot(value.rgb,vec3(.299,.587,.114)));
@@ -44,6 +32,11 @@ float materialFootprint(Triangle t,vec3 p) {
  return pixel/worldPerUv;
 }
 void materialRayCoordinates(uint primitive,vec3 origin,vec3 direction,out vec2 uv,out float footprint) {
+ if(isCurve(triangles[primitive])) {
+  float distance;curveIntersect(primitive,origin,direction,0.,1e30,distance);
+  vec2 bary=vec2(distance,0);Triangle c=hitTriangle(primitive,bary,origin,direction);
+  uv=c.uv01.xy;footprint=materialFootprint(c,c.a.xyz);return;
+ }
  Triangle t=triangles[primitive];vec3 e=t.b.xyz-t.a.xyz,f=t.c.xyz-t.a.xyz;
  vec3 n=cross(e,f);float denom=dot(n,direction);
  float distance=abs(denom)>1e-20?dot(n,t.a.xyz-origin)/denom:0.;

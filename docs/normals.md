@@ -23,10 +23,21 @@ The shading pass barycentrically interpolates and normalizes the three corner
 normals for every primary and secondary surface hit. Both the legacy BSDF and
 OpenPBR use this shading frame, in both ray-query and raster visibility modes.
 Zero corner normals and cancelling interpolants use geometric fallback. Shading
-normals are aligned to the geometric hemisphere; grazing configurations that
-would change entering/exiting classification fall back to the geometric frame.
+normals are aligned to the geometric hemisphere. After normal and bump mapping,
+grazing configurations project an invalid shading normal continuously onto the
+intersection of the geometric and view hemispheres, with a small positive
+grazing margin. This replaces the abrupt switch back
+to the unperturbed normal that produced camera-dependent patches. The corrected
+normal keeps its outward orientation, allowing OpenPBR to handle back faces and
+entering/exiting IORs. UV handedness is preserved in the final anisotropic frame.
 Geometric normals determine ray offsets and reject reflection/transmission paths
 on inconsistent geometric sides, preventing below-surface light leaks.
+
+Opaque convex patches with varying corner normals additionally use a virtual
+lighting point and smooth transport hemisphere to reduce the polygonal shadow
+terminator. See [shadow terminator correction](shadow-terminator.md) for scope,
+limitations and validation. Flat geometry and transmissive boundaries retain the
+original geometric-side tests.
 
 The accumulation pass remains independent of normals/materials. Editing normals
 invalidates the immutable geometry snapshot and resets accumulation when the
@@ -45,6 +56,9 @@ checks all interpolation rates, indexed primvar precedence, transforms and JSON
 lowering. `LAVA_TEST_NORMALS=1 build/lava_usd_smoke build/normals.usda /World/Camera`
 checks native import and rendered irradiance; GPU tests cover both visibility
 modes, OpenPBR/legacy shading, geometric fallback and light-leak rejection.
+`mapped_normals_remain_continuous_when_orbiting_and_work_from_behind` additionally
+checks normal and height maps across the former camera-angle cutoff, and verifies
+that normal mapping remains active from the back side.
 
 The normal regression generator also accepts a subdivision scheme, for example
 `scripts/test_normals.py build/normals-catmull.usda catmullClark`. The native

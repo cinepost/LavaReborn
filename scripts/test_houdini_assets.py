@@ -28,6 +28,8 @@ assert p.GetTypeName()=='RenderSettings'
 assert p.GetAttribute('lava:samples').Get()==64
 assert p.GetAttribute('lava:visibility').Get()=='ray_query'
 assert p.GetAttribute('lava:textures').Get()=='original'
+assert p.GetAttribute('lava:reduceAnalyticCaustics').Get() is False
+assert r.parm('reduce_analytic_caustics').eval()==0
 assert r.parm('textures').parmTemplate().menuItems()==('original','compressed','virtual')
 assert p.GetRelationship('camera').GetTargets()==[Sdf.Path('/cameras/camera1')]
 def pv(path,name):return UsdGeom.PrimvarsAPI(s.GetPrimAtPath(path)).GetPrimvar('lava:'+name)
@@ -39,12 +41,14 @@ assert not pv('/lights/point','renderLightGeometry')
 assert not pv('/World/ordinary','renderLightGeometry')
 l.parm('single_sided').set(False);l.parm('render_light_geometry').set(True)
 r.parm('textures').set('compressed')
+r.parm('reduce_analytic_caustics').set(True)
 r.parm('samples').set(17);r.parm('diffuse_depth').set(1);r.parm('visibility').set('raster')
 s=l.stage();assert not l.errors(),l.errors()
 assert pv('/lights/rect','singleSided').Get() is False
 assert pv('/lights/mesh','renderLightGeometry').Get() is True
 assert s.GetPrimAtPath('/Render/Lava').GetAttribute('lava:samples').Get()==17
 assert s.GetPrimAtPath('/Render/Lava').GetAttribute('lava:textures').Get()=='compressed'
+assert s.GetPrimAtPath('/Render/Lava').GetAttribute('lava:reduceAnalyticCaustics').Get() is True
 assert s.GetPrimAtPath('/Render/Lava').GetAttribute('lava:visibility').Get()=='raster'
 assert [p.label() for p in r.parmTemplateGroup().entries() if isinstance(p,hou.FolderParmTemplate)]==['Render Settings Prim','Sampling','Limits','Textures','Image']
 s.Export(str(root.parent/'lava_light_properties.usda'))

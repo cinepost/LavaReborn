@@ -1,0 +1,45 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "camera.glsl"
+layout(local_size_x=32) in;
+struct Payload {uint ids[32];};
+taskPayloadSharedEXT Payload payload;
+shared uint activeCount;
+shared uint clusterVisible;
+bool visibleBounds(vec3 lo,vec3 hi){
+ mat4 projection=cameraProjection();uint mask=63u;
+ for(uint corner=0;corner<8;corner++){
+  vec3 p=vec3((corner&1u)==0u?lo.x:hi.x,(corner&2u)==0u?lo.y:hi.y,(corner&4u)==0u?lo.z:hi.z);
+  vec4 clip=projection*vec4((camera.worldToCamera*vec4(p,1)).xyz-cameraLens(),1);
+  uint side=(clip.x< -clip.w?1u:0u)|(clip.x>clip.w?2u:0u)|(clip.y< -clip.w?4u:0u)|(clip.y>clip.w?8u:0u)|(clip.z<0.?16u:0u)|(clip.z>clip.w?32u:0u);
+  mask&=side;
+ }
+ return mask==0u;
+}
+void main(){
+ uint lane=gl_LocalInvocationIndex,first=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*32u;
+ if(lane==0u){
+  activeCount=0u;vec3 lo=vec3(1e30),hi=vec3(-1e30);
+  for(uint i=first;i<min(first+32u,pc.curveCount);i++){
+   Triangle c=triangles[pc.meshTriangles+i];float r=max(c.a.w,c.b.w);
+   lo=min(lo,min(c.a.xyz,c.b.xyz)-r);hi=max(hi,max(c.a.xyz,c.b.xyz)+r);
+  }
+  clusterVisible=visibleBounds(lo,hi)?1u:0u;
+ }
+ barrier();uint index=first+lane;
+ if(clusterVisible!=0u&&index<pc.curveCount){
+  Triangle c=triangles[pc.meshTriangles+index];float r=max(c.a.w,c.b.w);
+  bool keep=visibleBounds(min(c.a.xyz,c.b.xyz)-r,max(c.a.xyz,c.b.xyz)+r);
+  vec3 a=(camera.worldToCamera*vec4(c.a.xyz,1)).xyz,b=(camera.worldToCamera*vec4(c.b.xyz,1)).xyz;
+  float scale=camera.optics.w>0.?1.:camera.optics.z/max(camera.clippingOffset.x,min(-a.z,-b.z)-r);
+  float pixels=2.*r*scale*max(float(pc.width)/camera.optics.x,float(pc.height)/camera.optics.y);
+  // Approximate viewport LOD only. Final rendering retains every strand.
+  if(pc.samplingMode==0u&&pixels<.25)keep=false;
+  if(keep){uint slot=atomicAdd(activeCount,1u);payload.ids[slot]=pc.meshTriangles+index;}
+ }
+ barrier();EmitMeshTasksEXT(activeCount,1u,1u);
+}

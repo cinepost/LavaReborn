@@ -111,6 +111,8 @@ pub fn compile(
             match source.extension().and_then(|s| s.to_str()) {
                 Some("vert") => "vertex",
                 Some("frag") => "fragment",
+                Some("mesh") => "mesh",
+                Some("task") => "amplification",
                 _ => "compute",
             },
         ]);

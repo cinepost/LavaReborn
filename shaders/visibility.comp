@@ -6,6 +6,7 @@
 #include "light_bvh.glsl"
 #include "camera.glsl"
 #include "materials/visibility.glsl"
+#include "query.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
@@ -19,21 +20,18 @@ void main() {
                         camera.clippingOffset.x * planeScale, direction,
                         camera.clippingOffset.y * planeScale);
   while(rayQueryProceedEXT(q)){
-   if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT) {
-    uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
-    if(triangles[candidate].uv2.z==0. && materialCovered(candidate,rayQueryGetWorldRayOriginEXT(q),rayQueryGetWorldRayDirectionEXT(q)))rayQueryConfirmIntersectionEXT(q);
-   }
+   confirmCandidate(q,camera.clippingOffset.x*planeScale,camera.clippingOffset.y*planeScale,true);
   }
   hits[i] = Hit(0, 0., 0., 0.,uvec4(0));
   float closest=camera.clippingOffset.y*planeScale;
   if (rayQueryGetIntersectionTypeEXT(q, true) !=
       gl_RayQueryCommittedIntersectionNoneEXT) {
-    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(q, true);
+    vec2 bary = queryCoordinates(q);
     closest=rayQueryGetIntersectionTEXT(q,true);
     hits[i] =
-        Hit(rayQueryGetIntersectionPrimitiveIndexEXT(q, true) + 1u, bary.x,
+        Hit(queryPrimitive(q) + 1u, bary.x,
             bary.y, rayQueryGetIntersectionTEXT(q, true) / planeScale,uvec4(0));
-    uint primitive=hits[i].primitive-1u;Triangle t=triangles[primitive];
+    uint primitive=hits[i].primitive-1u;Triangle t=hitTriangle(primitive,bary,origin,direction);
     vec2 uv=t.uv01.xy*(1.-bary.x-bary.y)+t.uv01.zw*bary.x+t.uv2.xy*bary.y;
     hits[i].attributes=uvec4(materialId(primitive),floatBitsToUint(uv),0);
   }

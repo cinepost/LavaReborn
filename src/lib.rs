@@ -17,4 +17,5 @@ mod raster;
 
 mod sampling;
 
+pub mod curves;
 pub mod texture;

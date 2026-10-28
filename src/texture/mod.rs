@@ -1,6 +1,7 @@
 //! Parallel image preparation and versioned texture assets, independent of Vulkan/material passes.
 mod bc4;
 pub mod gpu;
+pub mod udim;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +14,36 @@ use std::{
 
 pub const MAX_TEXTURES: usize = 128;
 pub const MATERIAL_FIELDS: usize = 40; // 38 material fields plus normal and bump texture slots.
+/// GPU ABI v1. Indices/offsets are valid for the currently bound texture table.
+/// A solid placeholder delegates its value to the sampling pass/material.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TextureHandle {
+    pub flags: u32,
+    pub table_offset: u32,
+    pub tile_count: u32,
+    pub reserved: u32,
+}
+impl TextureHandle {
+    pub const PLAIN: u32 = 1;
+    pub const UDIM: u32 = 2;
+    pub const VIRTUAL: u32 = 4;
+    pub const SOLID: u32 = 8;
+    pub fn placeholder(flags: u32) -> Self {
+        Self {
+            flags: flags | Self::SOLID,
+            ..Default::default()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TextureTile {
+    /// UDIM number (zero for plain images), descriptor index, reserved, reserved.
+    pub info: [u32; 4],
+    pub range_scale: [f32; 4],
+    pub range_bias: [f32; 4],
+}
 const CACHE_VERSION: u32 = 2;
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
@@ -119,9 +150,57 @@ pub struct LoadRequest {
     pub color_space: ColorSpace,
     pub compression: CompressionSettings,
 }
+/// Normalize Houdini's printf UDIM token and expand $VAR/${VAR} without a shell.
+/// Unset variables remain visible so a missing environment never becomes a
+/// silently different relative path. Houdini's frontend also expands its globals.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let Some(path) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let path = path.replace("%(UDIM)d", "<UDIM>");
+    let mut out = String::new();
+    let mut rest = path.as_str();
+    while let Some(start) = rest.find('$') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let (name, end) = if rest.starts_with("${") {
+            if let Some(end) = rest.find('}') {
+                (&rest[2..end], end + 1)
+            } else {
+                out.push_str(rest);
+                rest = "";
+                break;
+            }
+        } else {
+            let end = 1 + rest[1..]
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            (&rest[1..end], end)
+        };
+        if name.is_empty() {
+            out.push('$');
+            rest = &rest[1..];
+            continue;
+        }
+        if let Ok(value) = std::env::var(name) {
+            out.push_str(&value);
+        } else {
+            out.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    PathBuf::from(out)
+}
 impl LoadRequest {
     pub fn new(binding: &TextureBinding, mode: TextureMode, color: bool) -> Self {
-        let file = std::fs::canonicalize(&binding.file).unwrap_or_else(|_| binding.file.clone());
+        let file = normalize_path(&binding.file);
+        let file = if mode == TextureMode::Virtual {
+            file
+        } else {
+            std::fs::canonicalize(&file).unwrap_or(file)
+        };
         let ext = file
             .extension()
             .and_then(|s| s.to_str())

@@ -257,12 +257,11 @@ impl Drop for GpuTexture {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuSlot {
+    handle: TextureHandle,
     info: [u32; 4],
     scale: [f32; 4],
     bias: [f32; 4],
     uv: [f32; 4],
-    range_scale: [f32; 4],
-    range_bias: [f32; 4],
     parameters: [f32; 4],
 }
 struct Input {
@@ -288,7 +287,10 @@ pub struct MaterialTextures {
     resident: HashMap<LoadRequest, GpuTexture>,
     white: GpuTexture,
     table: Option<Buffer>,
+    tile_table: Option<Buffer>,
+    catalog: udim::Catalog,
     dirty: bool,
+    handles: HashMap<(usize, usize), TextureHandle>,
     upload_sender: Option<mpsc::Sender<UploadJob>>,
     uploaded: mpsc::Receiver<Uploaded>,
     uploading: HashSet<LoadRequest>,
@@ -345,44 +347,79 @@ impl MaterialTextures {
             resident: HashMap::new(),
             white,
             table: None,
+            tile_table: None,
+            catalog: udim::Catalog::new(),
             dirty: true,
+            handles: HashMap::new(),
         })
     }
     pub fn configure(&mut self, materials: Vec<Material>, mode: TextureMode) -> Result<()> {
         self.materials = materials;
         self.mode = mode;
         self.inputs.clear();
-        let mut unique = HashSet::new();
-        if mode != TextureMode::Virtual {
-            for (material, m) in self.materials.iter().enumerate() {
-                for (name, binding) in &m.textures {
-                    let (field, color) =
-                        crate::material::texture_field(name).context("unknown texture input")?;
-                    let request = LoadRequest::new(binding, mode, color);
-                    unique.insert(request.clone());
-                    self.inputs.push(Input {
-                        material,
-                        field,
-                        binding: binding.clone(),
-                        request,
-                    });
+        let mut patterns = HashSet::new();
+        for (material, m) in self.materials.iter().enumerate() {
+            for (name, binding) in &m.textures {
+                let (field, color) =
+                    crate::material::texture_field(name).context("unknown texture input")?;
+                let request = LoadRequest::new(binding, mode, color);
+                if mode != TextureMode::Virtual && udim::is_udim(&request.file) {
+                    patterns.insert(request.clone());
                 }
+                self.inputs.push(Input {
+                    material,
+                    field,
+                    binding: binding.clone(),
+                    request,
+                });
             }
         }
+        self.catalog.configure(&patterns);
+        self.reconcile()?;
+        self.dirty = true;
+        Ok(())
+    }
+    fn requests(&self) -> HashSet<LoadRequest> {
+        if self.mode == TextureMode::Virtual {
+            return HashSet::new();
+        }
+        self.inputs
+            .iter()
+            .flat_map(|i| {
+                if udim::is_udim(&i.request.file) {
+                    self.catalog
+                        .tiles(&i.request)
+                        .iter()
+                        .map(|tile| {
+                            let mut request = i.request.clone();
+                            request.file = tile.file.clone();
+                            request
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![i.request.clone()]
+                }
+            })
+            .collect()
+    }
+    fn reconcile(&mut self) -> Result<()> {
+        let unique = self.requests();
         ensure!(
             unique.len() < MAX_TEXTURES,
-            "prototype supports at most {} distinct textures per scene",
+            "prototype supports at most {} distinct resident texture images, including UDIM tiles",
             MAX_TEXTURES - 1
         );
         let active: Vec<_> = unique.into_iter().collect();
         self.manager.retain(&active);
-        self.resident.retain(|key, _| active.contains(key));
-        self.upload_errors.retain(|key, _| active.contains(key));
+        self.resident.retain(|r, _| active.contains(r));
+        self.upload_errors.retain(|r, _| active.contains(r));
         for request in active {
             self.manager.request(request);
         }
-        self.dirty = true;
         Ok(())
+    }
+    pub fn handle(&self, material: usize, field: usize) -> Option<TextureHandle> {
+        self.handles.get(&(material, field)).copied()
     }
     pub fn set_mode(&mut self, mode: TextureMode) -> Result<()> {
         if mode != self.mode {
@@ -397,11 +434,18 @@ impl MaterialTextures {
             .collect()
     }
     pub fn pending(&self) -> bool {
-        self.manager.pending() || self.manager.has_ready() || !self.uploading.is_empty()
+        self.catalog.pending()
+            || self.manager.pending()
+            || self.manager.has_ready()
+            || !self.uploading.is_empty()
     }
     pub fn poll(&mut self, wait: bool, set: vk::DescriptorSet) -> Result<bool> {
-        let unique: HashSet<_> = self.inputs.iter().map(|i| i.request.clone()).collect();
         loop {
+            if self.catalog.poll() {
+                self.reconcile()?;
+                self.dirty = true;
+            }
+            let unique = self.requests();
             self.manager.poll_limited(4);
             while let Ok(done) = self.uploaded.try_recv() {
                 self.uploading.remove(&done.request);
@@ -449,11 +493,14 @@ impl MaterialTextures {
             if !wait {
                 break;
             }
+            if !self.catalog.scanning() {
+                self.catalog.check_errors()?;
+            }
             self.manager.check_errors()?;
             if let Some(error) = self.upload_errors.values().next() {
                 bail!("final texture upload failed: {error}");
             }
-            if !self.pending() {
+            if !self.pending() && !self.catalog.scanning() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -474,49 +521,108 @@ impl MaterialTextures {
             descriptors[i + 1] = texture.descriptor();
             indices.insert(request, i + 1);
         }
+        let mut tiles = Vec::<TextureTile>::new();
+        let mut handles = HashMap::<LoadRequest, TextureHandle>::new();
+        self.handles.clear();
         for input in &self.inputs {
-            if let (Some(&index), Some(texture)) = (
-                indices.get(&input.request),
-                self.resident.get(&input.request),
-            ) {
-                let b = &input.binding;
-                let channel = match b.channel.as_str() {
-                    "r" => 0,
-                    "g" => 1,
-                    "b" => 2,
-                    "a" => 3,
-                    "luminance" => 5,
-                    _ => 4,
+            let b = &input.binding;
+            let handle = *handles.entry(input.request.clone()).or_insert_with(|| {
+                let udim = udim::is_udim(&input.request.file);
+                let flags = if udim {
+                    TextureHandle::UDIM
+                } else {
+                    TextureHandle::PLAIN
                 };
-                let wrap = |w| match w {
-                    Wrap::Repeat => 0,
-                    Wrap::Clamp => 1,
-                    Wrap::Mirror => 2,
-                    Wrap::Black => 3,
+                if self.mode == TextureMode::Virtual {
+                    return TextureHandle::placeholder(flags | TextureHandle::VIRTUAL);
+                }
+                let offset = tiles.len() as u32;
+                let entries = if udim {
+                    self.catalog
+                        .tiles(&input.request)
+                        .iter()
+                        .map(|tile| {
+                            let mut r = input.request.clone();
+                            r.file = tile.file.clone();
+                            (tile.number, r)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![(0, input.request.clone())]
                 };
-                slots[input.material * MATERIAL_FIELDS + input.field] = GpuSlot {
-                    info: [index as u32, channel, wrap(b.wrap_s), wrap(b.wrap_t)],
-                    scale: b.scale,
-                    bias: b.bias,
-                    uv: [b.uv_scale[0], b.uv_scale[1], b.uv_offset[0], b.uv_offset[1]],
-                    range_scale: texture.scale,
-                    range_bias: texture.bias,
-                    parameters: [
-                        b.multiply as u8 as f32,
-                        b.strength,
-                        b.signed as u8 as f32,
-                        0.,
-                    ],
-                };
-            }
+                for (number, request) in entries {
+                    if let (Some(&index), Some(texture)) =
+                        (indices.get(&request), self.resident.get(&request))
+                    {
+                        tiles.push(TextureTile {
+                            info: [number, index as u32, 0, 0],
+                            range_scale: texture.scale,
+                            range_bias: texture.bias,
+                        });
+                    }
+                }
+                let count = tiles.len() as u32 - offset;
+                TextureHandle {
+                    flags: flags | if count == 0 { TextureHandle::SOLID } else { 0 },
+                    table_offset: offset,
+                    tile_count: count,
+                    reserved: 0,
+                }
+            });
+            self.handles.insert((input.material, input.field), handle);
+            let channel = match b.channel.as_str() {
+                "r" => 0,
+                "g" => 1,
+                "b" => 2,
+                "a" => 3,
+                "luminance" => 5,
+                _ => 4,
+            };
+            let wrap = |w| match w {
+                Wrap::Repeat => 0,
+                Wrap::Clamp => 1,
+                Wrap::Mirror => 2,
+                Wrap::Black => 3,
+            };
+            slots[input.material * MATERIAL_FIELDS + input.field] = GpuSlot {
+                handle,
+                info: [
+                    u32::from(handle.flags & TextureHandle::SOLID == 0),
+                    channel,
+                    wrap(b.wrap_s),
+                    wrap(b.wrap_t),
+                ],
+                scale: b.scale,
+                bias: b.bias,
+                uv: [b.uv_scale[0], b.uv_scale[1], b.uv_offset[0], b.uv_offset[1]],
+                parameters: [
+                    b.multiply as u8 as f32,
+                    b.strength,
+                    b.signed as u8 as f32,
+                    0.,
+                ],
+            };
         }
+        if tiles.is_empty() {
+            tiles.push(TextureTile::zeroed());
+        }
+        let tile_table =
+            crate::material::upload_storage(self.device.clone(), bytemuck::cast_slice(&tiles))?;
         let bytes = bytemuck::cast_slice(&slots);
         let table = crate::material::upload_storage(self.device.clone(), bytes)?;
         unsafe {
             let buffer = [vk::DescriptorBufferInfo::default()
                 .buffer(table.raw)
                 .range(table.size)];
+            let tile_buffer = [vk::DescriptorBufferInfo::default()
+                .buffer(tile_table.raw)
+                .range(tile_table.size)];
             let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(20)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&tile_buffer),
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(18)
@@ -531,6 +637,7 @@ impl MaterialTextures {
             self.device.raw.update_descriptor_sets(&writes, &[]);
         }
         self.table = Some(table);
+        self.tile_table = Some(tile_table);
         Ok(())
     }
 }

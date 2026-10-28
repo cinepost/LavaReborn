@@ -84,6 +84,8 @@ pub enum Light {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     #[serde(default)]
+    pub curves: Vec<crate::curves::Curves>,
+    #[serde(default)]
     pub settings: crate::integrator::IntegratorSettings,
     pub camera: Camera,
     pub meshes: Vec<Mesh>,
@@ -360,6 +362,9 @@ impl Scene {
                 }
             }
         }
+        for (index, curves) in self.curves.iter().enumerate() {
+            triangles.extend(curves.segments(self.meshes.len() + index)?);
+        }
         ensure!(
             triangles.len() <= u32::MAX as usize / 3,
             "too many triangles"
@@ -508,7 +513,13 @@ impl Scene {
     /// OpenPBR tables replace material parameters without affecting AS geometry.
     /// Crossing the legacy/model boundary rebuilds the packed legacy attributes.
     pub(crate) fn same_geometry(&self, other: &Self) -> bool {
-        self.meshes.len() == other.meshes.len()
+        self.curves.len() == other.curves.len()
+            && self
+                .curves
+                .iter()
+                .zip(&other.curves)
+                .all(|(a, b)| a.same_geometry(b))
+            && self.meshes.len() == other.meshes.len()
             && self.meshes.iter().zip(&other.meshes).all(|(a, b)| {
                 let surface_tables = a.material.openpbr.is_some() && b.material.openpbr.is_some();
                 let attributes_match = surface_tables

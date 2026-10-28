@@ -20,8 +20,11 @@ fn main() {
         "visibility_resolve",
         "visibility_raster.vert",
         "visibility_raster.frag",
+        "curves.task",
+        "curves.mesh",
+        "curves.frag",
     ] {
-        let source = PathBuf::from(if pass.ends_with(".vert") || pass.ends_with(".frag") {
+        let source = PathBuf::from(if pass.contains('.') {
             format!("shaders/{pass}")
         } else {
             format!("shaders/{pass}.comp")

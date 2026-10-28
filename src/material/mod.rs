@@ -131,18 +131,20 @@ pub(crate) fn upload(
     let records: Vec<_> = scene
         .meshes
         .iter()
-        .map(|m| {
-            if m.material.openpbr.is_none() && !m.material.textures.is_empty() {
+        .map(|m| (&m.material, m.color))
+        .chain(scene.curves.iter().map(|c| (&c.material, c.color)))
+        .map(|(material, color)| {
+            if material.openpbr.is_none() && !material.textures.is_empty() {
                 OpenPbrSurface {
-                    base_color: m.color,
-                    base_metalness: m.material.metallic,
-                    transmission_weight: m.material.transmission,
-                    specular_ior: m.material.ior,
+                    base_color: color,
+                    base_metalness: material.metallic,
+                    transmission_weight: material.transmission,
+                    specular_ior: material.ior,
                     ..Default::default()
                 }
                 .gpu()
             } else {
-                m.material.gpu()
+                material.gpu()
             }
         })
         .collect();

@@ -6,8 +6,33 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from pxr import Usd, UsdGeom, UsdLux, UsdShade, Gf
+from pxr import Usd, UsdGeom, UsdLux, UsdShade, Gf, Sdf
 
+
+def expand_texture_path(path):
+    import re
+    path=path.replace('%(UDIM)d','<UDIM>')
+    try:
+        import hou
+        lookup=hou.getenv
+    except ImportError:
+        import os
+        lookup=os.environ.get
+    def replace(match):
+        value=lookup(match.group(1) or match.group(2))
+        return match.group(0) if value is None else value
+    return re.sub(r'\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)',replace,path)
+
+def texture_asset_path(asset):
+    return asset.path if '<UDIM>' in asset.path or '%(UDIM)d' in asset.path else (asset.resolvedPath or asset.path)
+
+def anchor_udim(attr,path):
+    path=expand_texture_path(path)
+    if '<UDIM>' not in path:return path
+    stack=attr.GetPropertyStack()
+    if not stack:return path
+    if not path.startswith('/') and ':' not in path and not path.startswith('./'):path='./'+path
+    return Sdf.ComputeAssetPathRelativeToLayer(stack[0].layer,path)
 
 def texture_input(shader, name, field):
     input_=shader.GetInput(name)
@@ -23,9 +48,8 @@ def texture_input(shader, name, field):
         return fallback if v is None else v
     asset=value('file',None)
     if not asset:return None
-    path=asset.resolvedPath or asset.path
-    if '<UDIM>' in path:
-        print(f"Lava [WARNING]: UDIM textures are not supported: {path}");return None
+    path=texture_asset_path(asset)
+    path=anchor_udim(texture.GetInput('file').GetAttr(),path)
     space=str(value('sourceColorSpace','auto'))
     if space=='sRGB':space='srgb'
     quality=str(value('lava:compressionQuality','balanced'))
@@ -40,34 +64,45 @@ def texture_input(shader, name, field):
         mode=str(value(name,'repeat'));result[key]=mode if mode in ('repeat','clamp','mirror','black') else 'repeat'
     return result
 
-def principled_textures(material,time):
-    source=material.GetSurfaceOutput('vex').GetConnectedSource()
+def principled_source(material):
+    output=material.GetSurfaceOutput('vex')
+    source=output.GetConnectedSource() if output else None
     if not source:return None
     prim=source[0].GetPrim()
     asset=prim.GetAttribute('info:sourceAsset').Get()
     if not asset or 'principledshader' not in asset.path:return None
+    return prim
+
+def principled_value(prim,name,time,default):
+    a=prim.GetAttribute('inputs:'+name)
+    v=a.Get(time) if a else None
+    if v is None and a:v=a.GetCustomDataByKey('HoudiniPreviewTags:default_value')
+    return default if v is None else v
+
+def principled_textures(material,time):
+    prim=principled_source(material)
+    if not prim:return None
     def value(name,default):
-        a=prim.GetAttribute('inputs:'+name)
-        v=a.Get(time) if a else None
-        if v is None and a:v=a.GetCustomDataByKey('HoudiniPreviewTags:default_value')
-        return default if v is None else v
+        return principled_value(prim,name,time,default)
     result={}
     def add(field,file,wrap,space,scale,bias,channel='rgb',strength=1,signed=False):
         asset=value(file,None)
         if not asset:return
-        colorspace=str(value(space,'auto' if field=='base_color' else 'raw'))
+        colorspace=str(value(space,'auto' if field in ('base_color','transmission_color') else 'raw'))
         if colorspace=='linear':colorspace='raw'
         mode=str(value(wrap,'repeat'))
-        result[field]={'file':asset.resolvedPath or asset.path,'color_space':colorspace if colorspace in ('raw','srgb') else 'auto',
+        result[field]={'file':anchor_udim(prim.GetAttribute('inputs:'+file),texture_asset_path(asset)),'color_space':colorspace if colorspace in ('raw','srgb') else 'auto',
                        'scale':scale,'bias':bias,'channel':channel,'strength':strength,'signed':signed,
                        'wrap_s':mode,'wrap_t':mode}
     if value('basecolor_useTexture',0):
         color=value('basecolor',[.2]*3);intensity=value('basecolor_textureIntensity',1)
         add('base_color','basecolor_texture','basecolor_textureWrap','basecolor_textureColorSpace',[c*intensity for c in color]+[1],[0]*4)
-    for name,field,default in [('rough','specular_roughness',.3),('metallic','base_metalness',0)]:
+    for name,field,default in [('rough','specular_roughness',.3),('metallic','base_metalness',0),('transparency','transmission_weight',0)]:
         if value(name+'_useTexture',0):
             channel=['luminance','r','g','b'][max(0,min(3,int(value(name+'_monoChannel',0))))]
             add(field,name+'_texture',name+'_textureWrap',name+'_textureColorSpace',[value(name,default)]*4,[0]*4,channel)
+    if value('transcolor_useTexture',0):
+        add('transmission_color','transcolor_texture','transcolor_textureWrap','transcolor_textureColorSpace',list(value('transcolor',[1]*3))+[1],[0]*4)
     if value('baseBumpAndNormal_enable',0):
         if value('baseBumpAndNormal_type','normal')=='bump':
             add('bump','baseBump_bumpTexture','baseBump_wrap','baseBump_colorSpace',[1]*4,[0]*4,'luminance',value('baseBump_bumpScale',.05))
@@ -75,6 +110,63 @@ def principled_textures(material,time):
             x=-1 if value('baseNormal_flipX',0) else 1;y=-1 if value('baseNormal_flipY',0) else 1
             add('normal','baseNormal_texture','baseNormal_wrap','baseNormal_colorspace',[2*x,2*y,2,1],[-x,-y,-1,0],strength=value('baseNormal_scale',1),signed=True)
     return result
+
+def bind_material(target,prim,time):
+    material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+    if material:
+        shader, _, _ = material.ComputeSurfaceSource()
+        if shader and shader.GetIdAttr().Get(time) == "UsdPreviewSurface":
+            def constant(name, fallback):
+                value = shader.GetInput(name).Get(time)
+                return fallback if value is None else value
+            target["color"] = list(constant("diffuseColor", target["color"]))
+            target["material"] = {"openpbr": {
+                "base_color": target["color"],
+                "base_metalness": min(1, max(0, float(constant("metallic", 0)))),
+                "transmission_weight": min(1, max(0, float(constant("transmission", 0)))),
+                "geometry_opacity": min(1, max(0, float(constant("opacity", 1)))),
+                "specular_roughness": min(1, max(0, float(constant("roughness", .5)))),
+                "specular_ior": min(4, max(1, float(constant("ior", 1.5)))),
+                "emission_luminance": 1,
+                "emission_color": list(constant("emissiveColor", [0,0,0])),
+            }}
+            source=principled_source(material)
+            if source:
+                target['material']['openpbr']['transmission_weight']=min(1,max(0,float(principled_value(source,'transparency',time,0))))
+                target['material']['openpbr']['transmission_color']=list(principled_value(source,'transcolor',time,[1]*3))
+                target['material']['openpbr']['geometry_opacity']=min(1,max(0,float(principled_value(source,'opac',time,1))))
+        elif shader and shader.GetIdAttr().Get(time) in ("ND_open_pbr_surface_surfaceshader", "open_pbr_surface", "OpenPBRSurface"):
+            # Native constants only; connected MaterialX graph generation is a future frontend.
+            import json
+            inputs={}
+            for input_ in shader.GetInputs():
+                value=input_.Get(time)
+                if value is not None:
+                    inputs[input_.GetBaseName()]=list(value) if isinstance(value,(Gf.Vec3f,Gf.Vec3d)) else value
+            target["material"]={"openpbr":inputs}
+    if material and shader:
+        texture_inputs={}
+        preview=shader.GetIdAttr().Get(time)=='UsdPreviewSurface'
+        names={'diffuseColor':'base_color','metallic':'base_metalness','roughness':'specular_roughness','transmission':'transmission_weight','transmissionColor':'transmission_color','ior':'specular_ior','opacity':'geometry_opacity','emissiveColor':'emission_color','normal':'normal'}
+        for input_ in shader.GetInputs():
+            name=input_.GetBaseName()
+            if not input_.HasConnectedSource():continue
+            field=names.get(name) if preview else name
+            if not field:continue
+            binding=texture_input(shader,name,field)
+            if binding:texture_inputs[field]=binding
+        if preview:
+            principled=principled_textures(material,time)
+            if principled is not None:
+                texture_inputs.pop("normal",None)
+                texture_inputs.pop("transmission_weight",None)
+                texture_inputs.pop("transmission_color",None)
+                texture_inputs.pop("geometry_opacity",None)
+                texture_inputs.update(principled)
+        if texture_inputs:
+            target.setdefault('material',{})['textures']=texture_inputs
+            if preview and 'emission_color' in texture_inputs:
+                target['material']['openpbr']['emission_luminance']=1
 
 def extract(stage, camera_path, frame):
     time = Usd.TimeCode(frame)
@@ -99,6 +191,8 @@ def extract(stage, camera_path, frame):
         if prim.GetTypeName()=="RenderSettings":
             attr=prim.GetAttribute("lava:visibility")
             if attr and attr.Get(time) is not None:scene.setdefault("settings",{})["visibility"]=str(attr.Get(time))
+            caustics=prim.GetAttribute("lava:reduceAnalyticCaustics")
+            if caustics and caustics.Get(time) is not None:scene.setdefault("settings",{})["reduce_analytic_caustics"]=bool(caustics.Get(time))
             mode=prim.GetAttribute("lava:textures")
             if mode and mode.Get(time) is not None:scene.setdefault("settings",{})["textures"]=str(mode.Get(time))
         imageable = UsdGeom.Imageable(prim)
@@ -107,7 +201,29 @@ def extract(stage, camera_path, frame):
         if imageable and imageable.ComputePurpose() not in (UsdGeom.Tokens.default_, UsdGeom.Tokens.render):
             continue
         matrix = cache.GetLocalToWorldTransform(prim)
-        if prim.IsA(UsdGeom.Mesh):
+        if prim.IsA(UsdGeom.BasisCurves):
+            curve=UsdGeom.BasisCurves(prim)
+            points=curve.GetPointsAttr().Get(time) or []
+            counts=list(curve.GetCurveVertexCountsAttr().Get(time) or [])
+            basis='linear' if curve.GetTypeAttr().Get(time)=='linear' else str(curve.GetBasisAttr().Get(time))
+            wrap=str(curve.GetWrapAttr().Get(time))
+            if basis not in ('linear','bezier','catmullRom','bspline') or wrap=='pinned':
+                print(f'Lava [WARNING]: unsupported curve basis/wrap on {prim.GetPath()}');continue
+            pv=UsdGeom.PrimvarsAPI(prim).GetPrimvar('radius')
+            custom=pv.ComputeFlattened(time) if pv else prim.GetAttribute('radius').Get(time)
+            is_radius=custom is not None
+            radii=custom if is_radius else curve.GetWidthsAttr().Get(time)
+            if radii is None:radii=[.01];is_radius=True
+            if isinstance(radii,(int,float)):radii=[radii]
+            rate=str(pv.GetInterpolation()) if pv and is_radius else ('vertex' if is_radius else str(curve.GetWidthsInterpolation()))
+            scale=max(matrix.TransformDir(Gf.Vec3d(*axis)).GetLength() for axis in [(1,0,0),(0,1,0),(0,0,1)])*(1 if is_radius else .5)
+            colors=curve.GetDisplayColorAttr().Get(time)
+            target={'points':[list(matrix.Transform(Gf.Vec3d(p))) for p in points], 'counts':counts,
+                    'basis':basis,'periodic':wrap=='periodic','radius':[float(r)*scale for r in radii],
+                    'radius_interpolation':rate,'color':list(colors[0]) if colors else [.5]*3}
+            bind_material(target,prim,time)
+            scene.setdefault('curves',[]).append(target)
+        elif prim.IsA(UsdGeom.Mesh):
             mesh = UsdGeom.Mesh(prim)
             colors = mesh.GetDisplayColorAttr().Get(time)
             counts = list(mesh.GetFaceVertexCountsAttr().Get(time) or [])
@@ -161,55 +277,7 @@ def extract(stage, camera_path, frame):
                     target["texcoord_indices"]=kept_faces
                 elif interpolation==UsdGeom.Tokens.constant:
                     target["texcoord_indices"]=[0]*len(kept_indices)
-            material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
-            if material:
-                shader, _, _ = material.ComputeSurfaceSource()
-                if shader and shader.GetIdAttr().Get(time) == "UsdPreviewSurface":
-                    def constant(name, fallback):
-                        value = shader.GetInput(name).Get(time)
-                        return fallback if value is None else value
-                    target = scene["meshes"][-1]
-                    target["color"] = list(constant("diffuseColor", target["color"]))
-                    target["material"] = {"openpbr": {
-                        "base_color": target["color"],
-                        "base_metalness": min(1, max(0, float(constant("metallic", 0)))),
-                        "transmission_weight": min(1, max(0, float(constant("transmission", 0)))),
-                        "geometry_opacity": min(1, max(0, float(constant("opacity", 1)))),
-                        "specular_roughness": min(1, max(0, float(constant("roughness", .5)))),
-                        "specular_ior": min(4, max(1, float(constant("ior", 1.5)))),
-                        "emission_luminance": 1,
-                        "emission_color": list(constant("emissiveColor", [0,0,0])),
-                    }}
-                elif shader and shader.GetIdAttr().Get(time) in ("ND_open_pbr_surface_surfaceshader", "open_pbr_surface", "OpenPBRSurface"):
-                    # Native constants only; connected MaterialX graph generation is a future frontend.
-                    import json
-                    inputs={}
-                    for input_ in shader.GetInputs():
-                        value=input_.Get(time)
-                        if value is not None:
-                            inputs[input_.GetBaseName()]=list(value) if isinstance(value,(Gf.Vec3f,Gf.Vec3d)) else value
-                    scene["meshes"][-1]["material"]={"openpbr":inputs}
-            if material and shader:
-                texture_inputs={}
-                preview=shader.GetIdAttr().Get(time)=='UsdPreviewSurface'
-                names={'diffuseColor':'base_color','metallic':'base_metalness','roughness':'specular_roughness','ior':'specular_ior','opacity':'geometry_opacity','emissiveColor':'emission_color','normal':'normal'}
-                for input_ in shader.GetInputs():
-                    name=input_.GetBaseName()
-                    if not input_.HasConnectedSource():continue
-                    field=names.get(name) if preview else name
-                    if not field:continue
-                    binding=texture_input(shader,name,field)
-                    if binding:texture_inputs[field]=binding
-                if preview:
-                    principled=principled_textures(material,time)
-                    if principled is not None:
-                        texture_inputs.pop("normal",None)
-                        texture_inputs.update(principled)
-                if texture_inputs:
-                    target=scene['meshes'][-1]
-                    target.setdefault('material',{})['textures']=texture_inputs
-                    if preview and 'emission_color' in texture_inputs:
-                        target['material']['openpbr']['emission_luminance']=1
+            bind_material(scene["meshes"][-1],prim,time)
         elif prim.HasAPI(UsdLux.LightAPI):
             api = UsdLux.LightAPI(prim)
             def attr(name, fallback):

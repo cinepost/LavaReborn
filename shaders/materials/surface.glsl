@@ -5,36 +5,41 @@
 #include "openpbr.h"
 #include "inputs.glsl"
 // Stable surface product API: consumers never inspect OpenPBR's internal lobes.
-struct MaterialSurface { OpenPBR_PreparedBsdf bsdf; vec3 normal; vec3 geometricNormal; vec3 view; uvec3 depth; };
+struct MaterialSurface { OpenPBR_PreparedBsdf bsdf; vec3 normal; vec3 geometricNormal; vec3 view; uvec3 depth; bool opaque; };
 MaterialSurface materialPrepare(uint id,vec3 normal,vec3 geometricNormal,vec3 view,vec3 throughput,uvec3 depth,vec2 uv,vec3 tangent,vec3 bitangent,float footprint) {
  MaterialSurface s;
  vec3 originalNormal=normal;
  vec3 projected=tangent-normal*dot(normal,tangent);
  vec3 t=length(projected)>1e-10?normalize(projected):normalize(cross(abs(normal.z)<.999?vec3(0,0,1):vec3(0,1,0),normal));
- vec3 b=cross(normal,t)*(dot(cross(normal,t),bitangent)<0.?-1.:1.);
+ float handedness=dot(cross(normal,t),bitangent)<0.?-1.:1.;
+ vec3 b=cross(normal,t)*handedness;
  TextureSlot ns=textureSlots[id*40u+38u];
- if(ns.info.x!=0u) {
+ if(ns.info.x!=0u&&textureAvailable(ns.handle,uv*ns.uv.xy+ns.uv.zw)) {
   vec3 mapped=materialValue(id,38u,uv,footprint).xyz;
   if(ns.parameters.z==0.)mapped=2.*mapped-1.;
   mapped.xy*=ns.parameters.y;
   if(dot(mapped,mapped)>1e-12)normal=normalize(t*mapped.x+b*mapped.y+normal*mapped.z);
  }
  TextureSlot bs=textureSlots[id*40u+39u];
- if(bs.info.x!=0u) {
-  vec2 size=vec2(textureSize(materialTextures[nonuniformEXT(bs.info.x)],0));
+ if(bs.info.x!=0u&&textureAvailable(bs.handle,uv*bs.uv.xy+bs.uv.zw)) {
+  vec2 size=textureSizeAt(bs.handle,uv*bs.uv.xy+bs.uv.zw);
   vec2 stepUv=max(vec2(max(footprint,1e-6)),1./max(size*abs(bs.uv.xy),vec2(1)));
   float hu=(materialValue(id,39u,uv+vec2(stepUv.x,0),footprint).x-materialValue(id,39u,uv-vec2(stepUv.x,0),footprint).x)/(2.*stepUv.x);
   float hv=(materialValue(id,39u,uv+vec2(0,stepUv.y),footprint).x-materialValue(id,39u,uv-vec2(0,stepUv.y),footprint).x)/(2.*stepUv.y);
   float area=dot(tangent,cross(bitangent,normal));
   if(abs(area)>1e-12)normal=normalize(normal-bs.parameters.y*(hu*cross(bitangent,normal)+hv*cross(normal,tangent))/area);
  }
- // Keep perturbed normals on the original geometric side and facing the view.
- if(dot(normal,geometricNormal)*dot(originalNormal,geometricNormal)<=0.||dot(normal,view)<=1e-6)normal=originalNormal;
+ // Apply geometric/view constraints once, after all maps. A hard fallback to
+ // originalNormal here created popping patches while orbiting and discarded
+ // every back-facing map. OpenPBR handles the back face and IOR swap itself.
+ if(any(isnan(normal))||any(isinf(normal)))normal=originalNormal;
+ normal=viewSafeNormal(normal,geometricNormal,view);
  tangent=t-normal*dot(normal,t);
- if(dot(tangent,tangent)<1e-12)tangent=cross(abs(normal.z)<.999?vec3(0,0,1):vec3(0,1,0),normal);
+ if(dot(tangent,tangent)<1e-12)tangent=openpbr_make_basis(normal).t;
  OpenPBR_ResolvedInputs inputs=materialInputs(id,normal,uv,footprint);
- inputs.geometry_basis=openpbr_make_basis(normal,tangent,1.);
+ inputs.geometry_basis=openpbr_make_basis(normal,tangent,handedness);
  inputs.geometry_coat_basis=inputs.geometry_basis;
+ s.opaque=inputs.transmission_weight<=0.;
  s.bsdf=openpbr_prepare(inputs,throughput,OpenPBR_BaseRgbWavelengths_nm,OpenPBR_VacuumIor,view);
  s.normal=normal;s.geometricNormal=geometricNormal;s.view=view;s.depth=depth;return s;
 }

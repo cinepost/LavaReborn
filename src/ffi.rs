@@ -176,7 +176,7 @@ pub unsafe extern "C" fn lava_update_view(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<u64> {
             let view: Scene = serde_json::from_str(CStr::from_ptr(json).to_str()?)?;
             anyhow::ensure!(
-                view.meshes.is_empty(),
+                view.meshes.is_empty() && view.curves.is_empty(),
                 "view updates must not contain geometry"
             );
             let mut request = s

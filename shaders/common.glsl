@@ -39,6 +39,9 @@ layout(push_constant) uniform Settings {
   uint maxGroupsX;
   uint samplingMode;
   uint targetSamples;
+  uint reduceAnalyticCaustics;
+  uint meshTriangles;
+  uint curveCount;
 }
 pc;
 uint hash(uint x) {

@@ -11,7 +11,8 @@ production path tracer.
 
 Requires Rust 1.88+, a Vulkan loader/driver, and `glslangValidator`, `spirv-val`, and `sha256sum` on PATH.
 On Linux, the shader compiler is commonly supplied by `glslang-tools`. The Rust
-build compiles six compute and two raster shader products to Vulkan 1.2 SPIR-V; no SDK is needed for
+build compiles six compute, two polygon raster, and three curve mesh/task/fragment
+shader products to Vulkan 1.2 SPIR-V; no SDK is needed for
 the standalone renderer. Dependencies are pinned in Cargo.lock.
 
 ```sh
@@ -142,6 +143,9 @@ See [examples/studio.json](examples/studio.json) and
   for ray offsets. Constant RGB base color is supported. Optional `material` fields select ideal
   metallic/dielectric transport (`metallic`, `transmission`, `ior`). JSON positions
   are world-space.
+- Linear/Bezier/Catmull-Rom/B-spline USD BasisCurves, custom radius or standard
+  widths, mesh/task-shader visibility and procedural AABB ray-query intersections
+  for primary, secondary and shadow rays. See [curve rendering](docs/curves.md).
 - Point, spot, rectangular area, and directional lights. Point/spot lighting uses
   inverse-square attenuation; area lights use area/cosine weighting. Intensities
   are prototype radiometric controls, not a complete USD Lux normalization model.
@@ -342,7 +346,8 @@ Houdini materials lower constant `UsdPreviewSurface` inputs to OpenPBR, includin
 base color, metalness, roughness, IOR, emission, and stochastic opacity coverage.
 Native `OpenPBRSurface`, `open_pbr_surface`, and
 `ND_open_pbr_surface_surfaceshader` terminals use the typed native OpenPBR inputs.
-Direct `UsdUVTexture` connections support color and scalar surface inputs. Other
+Direct `UsdUVTexture` connections support color and scalar surface inputs,
+including `<UDIM>` sets through GPU tile indirection. Other
 connected graphs warn and use constant fallbacks. Choose Original or Compressed
 (BC4/BC7) in Lava Render Settings > Textures; Virtual is inactive.
 [Texture loading, caching and limitations](docs/textures.md).
