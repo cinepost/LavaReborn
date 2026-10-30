@@ -191,6 +191,8 @@ def extract(stage, camera_path, frame):
         if prim.GetTypeName()=="RenderSettings":
             attr=prim.GetAttribute("lava:visibility")
             if attr and attr.Get(time) is not None:scene.setdefault("settings",{})["visibility"]=str(attr.Get(time))
+            chunk=prim.GetAttribute("lava:uploadChunkMiB")
+            if chunk and chunk.Get(time) is not None:scene.setdefault("settings",{})["upload_chunk_mib"]=int(chunk.Get(time))
             caustics=prim.GetAttribute("lava:reduceAnalyticCaustics")
             if caustics and caustics.Get(time) is not None:scene.setdefault("settings",{})["reduce_analytic_caustics"]=bool(caustics.Get(time))
             mode=prim.GetAttribute("lava:textures")

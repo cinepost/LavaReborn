@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "light_bvh.glsl"
+#include "camera.glsl"
+#include "materials/visibility.glsl"
+#include "query.glsl"
+#include "shadow_query.glsl"
+#include "shadow_profile.glsl"
+layout(local_size_x=64) in;
+layout(constant_id=52) const bool statisticsOnly=false;
+void main(){
+ uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64u+gl_LocalInvocationIndex;
+ bool enabledRay=i<pc.width*pc.height&&shadowRecords[i].result.z!=0u;
+ if(statisticsOnly){
+  bool occluded=false,mismatch=false;
+  if(enabledRay){occluded=shadowRecords[i].result.x==0u;mismatch=shadowRecords[i].result.x!=shadowRecords[i].result.y;}
+  uint count=subgroupBallotBitCount(subgroupBallot(enabledRay));
+  uint blocked=subgroupBallotBitCount(subgroupBallot(occluded));
+  uint wrong=subgroupBallotBitCount(subgroupBallot(mismatch));
+  if(subgroupElect()){atomicAdd(shadowStats.x,count);atomicAdd(shadowStats.y,blocked);atomicAdd(shadowStats.z,wrong);}
+ }else if(enabledRay){
+  ShadowRecord r=shadowRecords[i];
+  shadowRecords[i].result.y=uint(traceShadow(r.originDistance.xyz,r.directionLight.xyz,r.originDistance.w,floatBitsToUint(r.directionLight.w)));
+ }
+}

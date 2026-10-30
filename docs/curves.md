@@ -15,8 +15,9 @@ provided: curves use the existing legacy/OpenPBR material and texture subsystem.
 Cubic spans are evaluated into analytic, linearly tapered segments, eight per
 span by default. JSON `subdivisions` supports 1–64; linear spans require one
 segment. This is a finite spline approximation, not native hardware spline
-intersection. Each segment has a padded procedural AABB in a separate curve BLAS,
-instanced alongside polygon geometry in the TLAS. Ray-query candidate handling
+intersection. Each segment has a padded procedural AABB in a per-object curve BLAS,
+instanced alongside polygon geometry in the TLAS. Unchanged curve BLASes are reused
+across unrelated geometry edits. Ray-query candidate handling
 solves a tapered cone and round endcaps. The same routine handles primary rays,
 BSDF continuation, shadows and stochastic opacity. Quadratics are recentered
 along the ray to keep thin-strand intersections numerically stable.
@@ -56,6 +57,9 @@ All GPU paths still require the existing hardware ray-query support.
 Curve deformation/topology/radius edits follow the existing asynchronous immutable
 BLAS/TLAS replacement policy. OpenPBR material edits update tables without rebuilding
 curve geometry. No geometry/material dependency is added to accumulation.
+
+See [visibility performance](curves-visibility-performance.md) for the experimental
+polygon-first query product, measured costs, BLAS reuse and conservative Hi-Z design.
 
 ## Tests and example
 

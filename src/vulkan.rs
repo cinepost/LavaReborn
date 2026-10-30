@@ -312,11 +312,15 @@ impl Device {
         signal: vk::Semaphore,
         record: impl FnOnce(vk::CommandBuffer),
     ) -> Result<()> {
+        #[cfg(test)]
+        let wait_started = std::time::Instant::now();
         let _guard = self
             .submit_lock
             .lock()
             .map_err(|_| anyhow!("Vulkan submission lock poisoned"))?;
-        unsafe {
+        #[cfg(test)]
+        let hold_started = std::time::Instant::now();
+        let result = unsafe {
             let cmd = self.raw.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(self.pool)
@@ -356,7 +360,17 @@ impl Device {
             })();
             self.raw.free_command_buffers(self.pool, &[cmd]);
             result
-        }
+        };
+        #[cfg(test)]
+        SUBMIT_TIMINGS.with(|timings| {
+            if let Some(samples) = timings.borrow_mut().as_mut() {
+                samples.push([
+                    hold_started.duration_since(wait_started).as_secs_f64() * 1000.,
+                    hold_started.elapsed().as_secs_f64() * 1000.,
+                ]);
+            }
+        });
+        result
     }
 }
 impl Drop for Device {
@@ -374,9 +388,92 @@ pub struct Buffer {
     pub memory: vk::DeviceMemory,
     pub size: u64,
     pub allocation_size: u64,
+    #[cfg(test)]
+    pub(crate) memory_properties: vk::MemoryPropertyFlags,
     host: bool,
 }
 impl Buffer {
+    /// Upload immutable data into ordinary VRAM using a bounded, reusable staging
+    /// allocation. Each completed chunk releases the queue lock, allowing the
+    /// viewport to continue presenting the previous immutable scene snapshot.
+    pub fn uploaded(
+        device: Arc<Device>,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<Self> {
+        Self::uploaded_with_chunk_size(device, bytes, usage, 16 * 1024 * 1024)
+    }
+    pub(crate) fn uploaded_with_chunk_size(
+        device: Arc<Device>,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+        chunk_bytes: usize,
+    ) -> Result<Self> {
+        let output = Self::new(
+            device,
+            bytes.len() as u64,
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            false,
+        )?;
+        output.upload_staged_chunks(bytes, chunk_bytes)?;
+        Ok(output)
+    }
+    pub(crate) fn upload_staged_chunks(&self, bytes: &[u8], chunk_bytes: usize) -> Result<()> {
+        self.upload_staged_range(bytes, chunk_bytes, 0)
+    }
+    pub(crate) fn upload_staged_range(
+        &self,
+        bytes: &[u8],
+        chunk_bytes: usize,
+        base: u64,
+    ) -> Result<()> {
+        ensure!(
+            chunk_bytes > 0 && base <= self.size && bytes.len() as u64 <= self.size - base,
+            "invalid staged upload range"
+        );
+        let device = &self.device;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let staging = Self::new(
+            device.clone(),
+            bytes.len().min(chunk_bytes) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+        )?;
+        for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+            staging.write(chunk)?;
+            device.submit(|cmd| unsafe {
+                let offset = base + (index * chunk_bytes) as u64;
+                device.raw.cmd_copy_buffer(
+                    cmd,
+                    staging.raw,
+                    self.raw,
+                    &[vk::BufferCopy::default()
+                        .dst_offset(offset)
+                        .size(chunk.len() as u64)],
+                );
+                let barriers = [vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.raw)
+                    .offset(offset)
+                    .size(chunk.len() as u64)];
+                device.raw.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &barriers,
+                    &[],
+                );
+            })?;
+        }
+        Ok(())
+    }
     pub fn new(
         device: Arc<Device>,
         size: u64,
@@ -498,6 +595,8 @@ impl Buffer {
                 memory,
                 size,
                 allocation_size: req.size,
+                #[cfg(test)]
+                memory_properties: props.memory_types[index as usize].property_flags,
                 host,
             })
         }
@@ -556,6 +655,9 @@ pub struct Acceleration {
     pub device: Arc<Device>,
     pub raw: vk::AccelerationStructureKHR,
     _storage: Buffer,
+    count: u32,
+    top: bool,
+    flags: vk::BuildAccelerationStructureFlagsKHR,
 }
 impl Drop for Acceleration {
     fn drop(&mut self) {
@@ -580,11 +682,14 @@ impl Acceleration {
             } else {
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL
             };
-            let flags = if fast_build {
+            let mut flags = if fast_build {
                 vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
             } else {
                 vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
             };
+            if fast_build {
+                flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
+            }
             let geometries = [geometry];
             let mut info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(kind)
@@ -616,6 +721,9 @@ impl Acceleration {
                 device: device.clone(),
                 raw,
                 _storage: storage,
+                count,
+                top,
+                flags,
             };
             let alignment = device.scratch_alignment;
             let scratch = Buffer::new(
@@ -652,6 +760,82 @@ impl Acceleration {
             Ok(result)
         }
     }
+    /// Refit in place only at a renderer batch boundary, after prior submissions complete.
+    pub(crate) fn refit(&self, geometry: vk::AccelerationStructureGeometryKHR<'_>) -> Result<()> {
+        ensure!(
+            self.flags
+                .contains(vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE),
+            "AS was not built for refitting"
+        );
+        unsafe {
+            let geometries = [geometry];
+            let mut info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(if self.top {
+                    vk::AccelerationStructureTypeKHR::TOP_LEVEL
+                } else {
+                    vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL
+                })
+                .flags(self.flags)
+                .mode(vk::BuildAccelerationStructureModeKHR::UPDATE)
+                .src_acceleration_structure(self.raw)
+                .dst_acceleration_structure(self.raw)
+                .geometries(&geometries);
+            let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            self.device.accel.get_acceleration_structure_build_sizes(
+                vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                &info,
+                &[self.count],
+                &mut sizes,
+            );
+            let alignment = self.device.scratch_alignment;
+            let scratch = Buffer::new(
+                self.device.clone(),
+                sizes.update_scratch_size + alignment,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                false,
+            )?;
+            info = info.scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: (scratch.address() + alignment - 1) & !(alignment - 1),
+            });
+            let ranges = [
+                vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(self.count)
+            ];
+            self.device.submit(|cmd| {
+                let before = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                            | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                    )];
+                self.device.raw.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    vk::DependencyFlags::empty(),
+                    &before,
+                    &[],
+                    &[],
+                );
+                self.device
+                    .accel
+                    .cmd_build_acceleration_structures(cmd, &[info], &[&ranges]);
+                let after = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                    .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR)];
+                self.device.raw.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+                        | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &after,
+                    &[],
+                    &[],
+                );
+            })?;
+        }
+        Ok(())
+    }
     pub fn address(&self) -> u64 {
         unsafe {
             self.device.accel.get_acceleration_structure_device_address(
@@ -660,4 +844,77 @@ impl Acceleration {
             )
         }
     }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires hardware Vulkan; device-local multi-chunk geometry upload"]
+    fn staged_upload_preserves_bytes_across_chunk_boundaries() {
+        let device = Device::new(Instance::new().unwrap(), None).unwrap();
+        let words: Vec<u32> = (0..(16 * 1024 * 1024 / 4 + 12))
+            .map(|i| (i as u32).wrapping_mul(2654435761))
+            .collect();
+        let uploaded = Buffer::uploaded(
+            device.clone(),
+            bytemuck::cast_slice(&words),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .unwrap();
+        assert!(uploaded
+            .memory_properties
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
+        assert!(!uploaded.host);
+        let readback = Buffer::new(
+            device.clone(),
+            uploaded.size,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            true,
+        )
+        .unwrap();
+        device
+            .submit(|cmd| unsafe {
+                device.raw.cmd_copy_buffer(
+                    cmd,
+                    uploaded.raw,
+                    readback.raw,
+                    &[vk::BufferCopy::default().size(uploaded.size)],
+                );
+                device.raw.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                    &[],
+                    &[],
+                );
+            })
+            .unwrap();
+        let actual: Vec<u32> = readback
+            .read_floats(words.len())
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        assert!(actual == words, "staged geometry upload changed bytes");
+        let empty = Buffer::uploaded(device, &[], vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+        assert!(!empty.host);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SUBMIT_TIMINGS: std::cell::RefCell<Option<Vec<[f64; 2]>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn begin_submit_timings() {
+    SUBMIT_TIMINGS.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+#[cfg(test)]
+pub(crate) fn take_submit_timings() -> Vec<[f64; 2]> {
+    SUBMIT_TIMINGS.with(|t| t.borrow_mut().take().unwrap_or_default())
 }

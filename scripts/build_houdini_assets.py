@@ -56,11 +56,12 @@ def build(output):
   folder('sampling','Sampling',[
    string('mode','Render Mode','interactive',menu_items=('interactive','final'),menu_labels=('Interactive','Final')),
    string('visibility','Visibility Generator','ray_query',menu_items=('ray_query','raster'),menu_labels=('Hardware Ray Queries','Hardware Rasterisation')),
-   integer('samples','Samples',64,1048576,1,help='Interactive images update after each sample. Final rendering uses this fixed sample budget.'),
+   integer('samples','Samples',64,1024,1,help='Interactive images update after each sample. Final rendering uses this fixed sample budget.'),
    hou.ToggleParmTemplate('headlight','Automatic Headlight',default_value=True)]),
   folder('limits','Limits',[integer('diffuse_depth','Diffuse Limit',3,32),integer('reflection_depth','Reflection Limit',4,32),integer('refraction_depth','Refraction Limit',8,32),integer('roulette_start','Russian Roulette Start Depth',3,96),hou.ToggleParmTemplate('reduce_analytic_caustics','Reduce Analytic Light Caustics',default_value=False,help='Biased firefly reduction for reflected analytic-light contributions. Very sharp highlights can become dimmer. Diffuse lighting and emissive materials remain unchanged.')]),
   folder('textures_tab','Textures',[string('textures','Texture Mode','original',menu_items=('original','compressed','virtual'),menu_labels=('Original','Compressed (BC4/BC7)','Virtual (inactive)'),help='Original decodes the source. Compressed uses cached BC4 for grayscale and BC7 for color. Virtual is reserved and currently leaves texture inputs inactive.')]),
-  folder('image','Image',[hou.FloatParmTemplate('exposure','Exposure',1,default_value=(0,),min=-8,max=8,help='Display exposure in stops. +1 doubles brightness.')])
+  folder('image','Image',[hou.FloatParmTemplate('exposure','Exposure',1,default_value=(0,),min=-8,max=8,help='Display exposure in stops. +1 doubles brightness.')]),
+  folder('advanced','Advanced',[string('upload_chunk_mib','Geometry Upload Chunk Size','16',menu_items=('16','32','64'),menu_labels=('16 MiB','32 MiB','64 MiB'),help='Staging chunk size for subsequent geometry uploads. Larger chunks can shorten scene update time but increase viewport frame delays. Does not reset accumulation.')])
  ],RENDER_COOK,'Lava Render Settings\n\nConnect after the scene. Select /Render/Lava in the viewport Render Settings Prim selector. Only implemented renderer controls are exposed. Camera optics and depth of field are controlled by the Camera LOP.')
  asset(light,'lava::light_properties::1.0','Lava Light Properties',[
   string('primpattern','Primitives','/lights/*',help='Solaris selection pattern. Area lights and meshes with MeshLightAPI only.'),

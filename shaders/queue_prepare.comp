@@ -2,12 +2,16 @@
 #extension GL_EXT_ray_query : require
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#define LAVA_REORDER_ARGUMENTS
 #include "queue.glsl"
 layout(local_size_x=1) in;
 void main() {
   uint n=counts[pc.queueParity],groups=(n+63u)/64u;
   uint x=min(groups,pc.maxGroupsX);
   dispatchArgs=uvec4(x,x>0u?(groups+x-1u)/x:1u,1u,0u);
+  uint sortGroups=n>=1024u?(n+255u)/256u:0u;
+  uint sortX=min(sortGroups,pc.maxGroupsX);
+  queueControl.reorderDispatchArgs=uvec4(sortX,sortX>0u?(sortGroups+sortX-1u)/sortX:1u,1u,0u);
   counts[1u-pc.queueParity]=0u;
   counts[2]+=n;counts[3]=max(counts[3],n);
 }

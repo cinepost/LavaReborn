@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "geometry.glsl"
+#include "light_bvh.glsl"
+#include "camera.glsl"
+#include "queue.glsl"
+#include "materials/visibility.glsl"
+#include "query.glsl"
+#include "shadow_profile.glsl"
+layout(local_size_x=64) in;
+void main(){
+ uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64u+gl_LocalInvocationIndex;
+ if(i>=counts[pc.queueParity])return;
+ PathRay ray=pc.queueParity==0u?raysA[i]:raysB[i];
+ rayQueryEXT q;
+ rayQueryInitializeEXT(q,world,0u,255,ray.originPdf.xyz,1e-5,ray.directionDelta.xyz,1e30);
+ while(rayQueryProceedEXT(q))confirmCandidate(q,1e-5,1e30,false);
+ bool hit=rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+ uvec4 actual=uvec4(0,0,0,floatBitsToUint(1e30));
+ if(hit)actual=uvec4(queryPrimitive(q)+1u,floatBitsToUint(queryCoordinates(q)),floatBitsToUint(rayQueryGetIntersectionTEXT(q,true)));
+ if(any(notEqual(actual,continuationRecords[ray.state.x])))atomicAdd(shadowStats.w,1u);
+}

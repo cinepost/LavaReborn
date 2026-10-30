@@ -8,6 +8,8 @@
 #include "materials/visibility.glsl"
 #include "query.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
+// Retain the unified traversal as a specialization product for regression / timing.
+layout(constant_id=50) const bool polygonFirst=false;
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(p, uvec2(pc.width, pc.height))))
@@ -15,23 +17,42 @@ void main() {
   uint i=p.y*pc.width+p.x;
   vec3 origin, direction; float planeScale;
   cameraRay(p, origin, direction, planeScale);
-  rayQueryEXT q;
-  rayQueryInitializeEXT(q, world, 0u, 255, origin,
-                        camera.clippingOffset.x * planeScale, direction,
-                        camera.clippingOffset.y * planeScale);
-  while(rayQueryProceedEXT(q)){
-   confirmCandidate(q,camera.clippingOffset.x*planeScale,camera.clippingOffset.y*planeScale,true);
-  }
-  hits[i] = Hit(0, 0., 0., 0.,uvec4(0));
+  float tmin=camera.clippingOffset.x*planeScale;
   float closest=camera.clippingOffset.y*planeScale;
-  if (rayQueryGetIntersectionTypeEXT(q, true) !=
-      gl_RayQueryCommittedIntersectionNoneEXT) {
-    vec2 bary = queryCoordinates(q);
-    closest=rayQueryGetIntersectionTEXT(q,true);
-    hits[i] =
-        Hit(queryPrimitive(q) + 1u, bary.x,
-            bary.y, rayQueryGetIntersectionTEXT(q, true) / planeScale,uvec4(0));
-    uint primitive=hits[i].primitive-1u;Triangle t=hitTriangle(primitive,bary,origin,direction);
+  uint primitive=0xffffffffu;vec2 bary=vec2(0);
+  rayQueryEXT q;
+  if(!polygonFirst){
+    rayQueryInitializeEXT(q,world,0u,255u,origin,tmin,direction,closest);
+    while(rayQueryProceedEXT(q))confirmCandidate(q,tmin,closest,true);
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT){
+      primitive=queryPrimitive(q);bary=queryCoordinates(q);
+      closest=rayQueryGetIntersectionTEXT(q,true);
+    }
+  }else{
+  // Exact current-sample polygon depth bounds the entire curve traversal.
+  // Unlike a previous-frame / coarse Hi-Z value this is safe for lens jitter,
+  // cutouts, silhouettes, camera motion and orthographic cameras.
+  if(pc.meshTriangles>0u){
+    rayQueryInitializeEXT(q,world,0u,1u,origin,tmin,direction,closest);
+    while(rayQueryProceedEXT(q))confirmCandidate(q,tmin,closest,true);
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT){
+      primitive=queryPrimitive(q);bary=queryCoordinates(q);
+      closest=rayQueryGetIntersectionTEXT(q,true);
+    }
+  }
+  if(pc.curveCount>0u&&closest>tmin){
+    rayQueryInitializeEXT(q,world,0u,2u,origin,tmin,direction,closest);
+    while(rayQueryProceedEXT(q))confirmCandidate(q,tmin,closest,true);
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT){
+      primitive=queryPrimitive(q);bary=queryCoordinates(q);
+      closest=rayQueryGetIntersectionTEXT(q,true);
+    }
+  }
+  }
+  hits[i]=Hit(0,0.,0.,0.,uvec4(0));
+  if(primitive!=0xffffffffu){
+    hits[i]=Hit(primitive+1u,bary.x,bary.y,closest/planeScale,uvec4(0));
+    Triangle t=hitTriangle(primitive,bary,origin,direction);
     vec2 uv=t.uv01.xy*(1.-bary.x-bary.y)+t.uv01.zw*bary.x+t.uv2.xy*bary.y;
     hits[i].attributes=uvec4(materialId(primitive),floatBitsToUint(uv),0);
   }

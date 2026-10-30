@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{ensure, Result};
 use ash::vk;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -40,6 +40,51 @@ struct Push {
     mesh_triangles: u32,
     curve_count: u32,
 }
+/// Immutable object acceleration survives replacement of unrelated scene geometry.
+/// Weak cache ownership avoids retaining VRAM or creating a Device ownership cycle.
+struct CurveBlas {
+    acceleration: Acceleration,
+    _input: Buffer,
+    bounds: Vec<[f32; 6]>,
+    fast_build: bool,
+}
+impl CurveBlas {
+    fn cached(device: Arc<Device>, bounds: Vec<[f32; 6]>, fast_build: bool) -> Result<Arc<Self>> {
+        static CACHE: OnceLock<Mutex<Vec<Weak<CurveBlas>>>> = OnceLock::new();
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+        cache.retain(|entry| entry.strong_count() > 0);
+        for entry in cache.iter().filter_map(Weak::upgrade) {
+            if Arc::ptr_eq(&entry.acceleration.device, &device)
+                && entry.fast_build == fast_build
+                && entry.bounds == bounds
+            {
+                return Ok(entry);
+            }
+        }
+        let usage = vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        let input = Buffer::new(device.clone(), (bounds.len() * 24) as u64, usage, true)?;
+        input.write(bytemuck::cast_slice(&bounds))?;
+        let data = vk::AccelerationStructureGeometryAabbsDataKHR::default()
+            .data(vk::DeviceOrHostAddressConstKHR {
+                device_address: input.address(),
+            })
+            .stride(24);
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::AABBS)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs: data });
+        let acceleration =
+            Acceleration::build(device, geometry, bounds.len() as u32, false, fast_build)?;
+        let entry = Arc::new(Self {
+            acceleration,
+            _input: input,
+            bounds,
+            fast_build,
+        });
+        cache.push(Arc::downgrade(&entry));
+        Ok(entry)
+    }
+}
 /// Owns resources produced by this pass. Inputs refer to producers via the compiled DAG.
 pub(crate) struct PreparedGeometry {
     tri: Buffer,
@@ -50,8 +95,8 @@ pub(crate) struct PreparedGeometry {
     tlas: Acceleration,
     texture_materials: Vec<crate::material::Material>,
     texture_mode: crate::texture::TextureMode,
-    curve_blas: Option<Acceleration>,
-    curve_bounds: Option<Buffer>,
+    curve_blas: Vec<Arc<CurveBlas>>,
+    mesh_ranges: Vec<std::ops::Range<usize>>,
     mesh_triangles: u32,
     curve_count: u32,
 }
@@ -61,6 +106,7 @@ struct GpuPass {
     pipeline: vk::Pipeline,
     raster: Option<crate::raster::RasterVisibility>,
     prepare_pipeline: Option<vk::Pipeline>,
+    reorder_pipeline: Option<vk::Pipeline>,
     scratch: Vec<Buffer>,
     samples: u32,
 }
@@ -103,9 +149,10 @@ impl GpuPass {
     }
 }
 pub struct Renderer {
+    reorder_rays: bool,
     warned_curve_fallback: bool,
-    curve_blas: Option<Acceleration>,
-    curve_bounds: Option<Buffer>,
+    curve_blas: Vec<Arc<CurveBlas>>,
+    mesh_ranges: Vec<std::ops::Range<usize>>,
     mesh_triangles: u32,
     curve_count: u32,
     textures: crate::texture::gpu::MaterialTextures,
@@ -143,6 +190,21 @@ impl Renderer {
             && (self.curve_count == 0 || self.device.mesh_shader)
     }
     pub fn new(width: u32, height: u32, mode: Mode, gpu: Option<usize>) -> Result<Self> {
+        Self::new_with_ray_reordering(
+            width,
+            height,
+            mode,
+            gpu,
+            std::env::var("LAVA_RAY_REORDERING").as_deref() != Ok("0"),
+        )
+    }
+    fn new_with_ray_reordering(
+        width: u32,
+        height: u32,
+        mode: Mode,
+        gpu: Option<usize>,
+        reorder: bool,
+    ) -> Result<Self> {
         ensure!(
             width > 0 && height > 0 && width <= 16384 && height <= 16384,
             "resolution must be 1..16384"
@@ -153,9 +215,10 @@ impl Renderer {
         let material_luts = crate::material::upload_luts(device.clone())?;
         let sample_primes = crate::sampling::upload(device.clone())?;
         let mut r = Self {
+            reorder_rays: reorder,
             warned_curve_fallback: false,
-            curve_blas: None,
-            curve_bounds: None,
+            curve_blas: Vec::new(),
+            mesh_ranges: Vec::new(),
             mesh_triangles: 0,
             curve_count: 0,
             sample_primes,
@@ -202,7 +265,7 @@ impl Renderer {
             )?,
             Buffer::new(
                 r.device.clone(),
-                32,
+                48,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
@@ -218,7 +281,7 @@ impl Renderer {
                 .get_physical_device_properties(r.device.physical)
                 .limits
                 .max_compute_work_group_count[0];
-            let bindings: Vec<_> = (0..21)
+            let bindings: Vec<_> = (0..23)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
@@ -272,7 +335,7 @@ impl Renderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 16,
+                    descriptor_count: 18,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -290,12 +353,13 @@ impl Renderer {
                     .descriptor_pool(r.descriptor_pool)
                     .set_layouts(&layouts),
             )?[0];
-            let shaders: [&[u8]; 5] = [
+            let shaders: [&[u8]; 6] = [
                 include_bytes!(concat!(env!("OUT_DIR"), "/visibility.spv")),
                 include_bytes!(concat!(env!("OUT_DIR"), "/shading.spv")),
                 include_bytes!(concat!(env!("OUT_DIR"), "/accumulation.spv")),
                 include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.spv")),
                 include_bytes!(concat!(env!("OUT_DIR"), "/queue_prepare.spv")),
+                include_bytes!(concat!(env!("OUT_DIR"), "/queue_reorder.spv")),
             ];
             for (i, shader) in shaders.iter().enumerate() {
                 let output = Buffer::new(
@@ -327,10 +391,27 @@ impl Renderer {
                     &vk::ShaderModuleCreateInfo::default().code(&code),
                     None,
                 )?;
-                let stage = vk::PipelineShaderStageCreateInfo::default()
+                let polygon_first =
+                    u32::from(std::env::var("LAVA_CURVE_POLYGON_FIRST").as_deref() == Ok("1"))
+                        .to_ne_bytes();
+                let entries = [vk::SpecializationMapEntry::default()
+                    .constant_id(50)
+                    .offset(0)
+                    .size(4)];
+                let specialization = vk::SpecializationInfo::default()
+                    .map_entries(&entries)
+                    .data(&polygon_first);
+                let mut stage = vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::COMPUTE)
                     .module(module)
                     .name(c"main");
+                if i == 0 {
+                    stage = stage.specialization_info(&specialization);
+                }
+                let creation_started = std::time::Instant::now();
+                if std::env::var_os("LAVA_TRACE").is_some() {
+                    eprintln!("Lava pipeline: compiling product {i}");
+                }
                 let result = r.device.raw.create_compute_pipelines(
                     r.pipeline_cache.raw,
                     &[vk::ComputePipelineCreateInfo::default()
@@ -339,6 +420,12 @@ impl Renderer {
                     None,
                 );
                 r.device.raw.destroy_shader_module(module, None);
+                if std::env::var_os("LAVA_TRACE").is_some() {
+                    eprintln!(
+                        "Lava pipeline: product {i} ready in {:.3}s",
+                        creation_started.elapsed().as_secs_f64()
+                    );
+                }
                 let pipeline = match result {
                     Ok(p) => p[0],
                     Err((partial, e)) => {
@@ -350,6 +437,8 @@ impl Renderer {
                 };
                 if i == 4 {
                     r.passes[1].prepare_pipeline = Some(pipeline);
+                } else if i == 5 {
+                    r.passes[1].reorder_pipeline = Some(pipeline);
                 } else {
                     r.passes.push(GpuPass {
                         output,
@@ -357,6 +446,7 @@ impl Renderer {
                         pipeline,
                         raster: None,
                         prepare_pipeline: None,
+                        reorder_pipeline: None,
                         scratch: Vec::new(),
                         samples: 0,
                     });
@@ -461,8 +551,16 @@ impl Renderer {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
-        let tri = Buffer::new(device.clone(), geometry_bytes.len() as u64, usage, true)?;
-        tri.write(geometry_bytes)?;
+        #[cfg(test)]
+        let usage = usage | vk::BufferUsageFlags::TRANSFER_SRC;
+        // Traversal and shading fetch these records repeatedly. Host-visible
+        // memory is only staging; keeping the records there streams over PCIe.
+        let tri = Buffer::uploaded_with_chunk_size(
+            device.clone(),
+            geometry_bytes,
+            usage,
+            scene.settings.upload_chunk_mib as usize * 1024 * 1024,
+        )?;
         // BLAS positions are tightly packed; shading triangles retain std430 layout independently.
         let positions: Vec<[f32; 3]> = triangles
             .iter()
@@ -475,8 +573,12 @@ impl Renderer {
                 ]
             })
             .collect();
-        let vertices = Buffer::new(device.clone(), positions.len() as u64 * 12, usage, true)?;
-        vertices.write(bytemuck::cast_slice(&positions))?;
+        let vertices = Buffer::uploaded_with_chunk_size(
+            device.clone(),
+            bytemuck::cast_slice(&positions),
+            usage,
+            scene.settings.upload_chunk_mib as usize * 1024 * 1024,
+        )?;
         let data = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
             .vertex_format(vk::Format::R32G32B32_SFLOAT)
             .vertex_data(vk::DeviceOrHostAddressConstKHR {
@@ -500,7 +602,7 @@ impl Renderer {
             transform: vk::TransformMatrixKHR {
                 matrix: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
             },
-            instance_custom_index_and_mask: vk::Packed24_8::new(0, 255),
+            instance_custom_index_and_mask: vk::Packed24_8::new(0, 1),
             instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                 0,
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
@@ -510,52 +612,48 @@ impl Renderer {
             },
         };
         let mut instance_records = vec![instance];
-        let (curve_blas, curve_bounds) = if curve_count > 0 {
-            let mut bounds = Vec::<[f32; 6]>::new();
-            for t in &triangles[mesh_triangles as usize..] {
-                let r = t.a[3].max(t.b[3]);
-                bounds.push([
-                    t.a[0].min(t.b[0]) - r,
-                    t.a[1].min(t.b[1]) - r,
-                    t.a[2].min(t.b[2]) - r,
-                    t.a[0].max(t.b[0]) + r,
-                    t.a[1].max(t.b[1]) + r,
-                    t.a[2].max(t.b[2]) + r,
-                ]);
-            }
-            let buffer = Buffer::new(device.clone(), (bounds.len() * 24) as u64, usage, true)?;
-            buffer.write(bytemuck::cast_slice(&bounds))?;
-            let data = vk::AccelerationStructureGeometryAabbsDataKHR::default()
-                .data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: buffer.address(),
+        // Each curve object owns an independently reusable BLAS. Material IDs and
+        // global primitive offsets stay in shading records / TLAS instances, so
+        // mesh topology and material edits do not invalidate curve acceleration.
+        let mut curve_blas = Vec::new();
+        let mut first = mesh_triangles as usize;
+        while first < triangles.len() {
+            let material = triangles[first].material[3].to_bits();
+            let end = triangles[first..]
+                .iter()
+                .position(|t| t.material[3].to_bits() != material)
+                .map_or(triangles.len(), |n| first + n);
+            ensure!(
+                first < 0x1000000,
+                "curve instance primitive offset exceeds 24-bit Vulkan limit"
+            );
+            let bounds = triangles[first..end]
+                .iter()
+                .map(|t| {
+                    let r = t.a[3].max(t.b[3]);
+                    [
+                        t.a[0].min(t.b[0]) - r,
+                        t.a[1].min(t.b[1]) - r,
+                        t.a[2].min(t.b[2]) - r,
+                        t.a[0].max(t.b[0]) + r,
+                        t.a[1].max(t.b[1]) + r,
+                        t.a[2].max(t.b[2]) + r,
+                    ]
                 })
-                .stride(24);
-            let geometry = vk::AccelerationStructureGeometryKHR::default()
-                .geometry_type(vk::GeometryTypeKHR::AABBS)
-                .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs: data });
-            let acceleration = Acceleration::build(
-                device.clone(),
-                geometry,
-                curve_count,
-                false,
-                mode.policy().fast_build,
-            )?;
+                .collect();
+            let acceleration = CurveBlas::cached(device.clone(), bounds, mode.policy().fast_build)?;
             let mut curve_instance = instance;
-            curve_instance.instance_custom_index_and_mask =
-                vk::Packed24_8::new(mesh_triangles, 255);
+            // Masks permit exact polygon-first primary visibility. Secondary
+            // rays retain mask 255 and see every geometry class.
+            curve_instance.instance_custom_index_and_mask = vk::Packed24_8::new(first as u32, 2);
             curve_instance.acceleration_structure_reference =
                 vk::AccelerationStructureReferenceKHR {
-                    device_handle: acceleration.address(),
+                    device_handle: acceleration.acceleration.address(),
                 };
             instance_records.push(curve_instance);
-            (Some(acceleration), Some(buffer))
-        } else {
-            (None, None)
-        };
-        ensure!(
-            mesh_triangles < 0x1000000,
-            "curve instance primitive offset exceeds 24-bit Vulkan limit"
-        );
+            curve_blas.push(acceleration);
+            first = end;
+        }
         let instances = Buffer::new(
             device.clone(),
             (std::mem::size_of_val(&instance) * instance_records.len()) as u64,
@@ -585,7 +683,15 @@ impl Renderer {
             mode.policy().fast_build,
         )?;
         let materials = crate::material::upload(device.clone(), scene)?;
+        let mut offset = 0;
+        let mut mesh_ranges = Vec::new();
+        for mesh in &scene.meshes {
+            let count = Self::mesh_records(scene, mesh)?.len();
+            mesh_ranges.push(offset..offset + count);
+            offset += count;
+        }
         Ok(PreparedGeometry {
+            mesh_ranges,
             texture_materials: scene
                 .meshes
                 .iter()
@@ -593,7 +699,6 @@ impl Renderer {
                 .chain(scene.curves.iter().map(|c| c.material.clone()))
                 .collect(),
             curve_blas,
-            curve_bounds,
             mesh_triangles,
             curve_count,
             texture_mode: scene.settings.textures,
@@ -613,10 +718,10 @@ impl Renderer {
             eprintln!("Lava [WARNING]: mesh/task shaders unavailable; curve scenes use hardware ray-query visibility instead of raster visibility.");
             self.warned_curve_fallback = true;
         }
+        self.mesh_ranges = geometry.mesh_ranges;
         self.mesh_triangles = geometry.mesh_triangles;
         self.curve_count = geometry.curve_count;
         self.curve_blas = geometry.curve_blas;
-        self.curve_bounds = geometry.curve_bounds;
         self.textures
             .configure(geometry.texture_materials, geometry.texture_mode)?;
         let placeholder = || {
@@ -638,6 +743,118 @@ impl Renderer {
         self.scene_buffers = buffers;
         self.tlas = Some(geometry.tlas);
         self.blas = Some(geometry.blas);
+        Ok(())
+    }
+    fn mesh_records(
+        scene: &Scene,
+        mesh: &crate::scene::Mesh,
+    ) -> Result<Vec<crate::scene::Triangle>> {
+        let local = Scene {
+            camera: scene.camera.clone(),
+            settings: scene.settings,
+            lights: Vec::new(),
+            meshes: vec![mesh.clone()],
+            curves: Default::default(),
+        };
+        Ok(local.prepare_geometry()?.0)
+    }
+    /// Small fixed-topology deformations commit at the boundary between batches.
+    /// All CPU validation finishes before any live GPU resource is modified.
+    pub(crate) fn try_refit_meshes(&mut self, previous: &Scene, scene: &Scene) -> Result<bool> {
+        let preparation_started = std::time::Instant::now();
+        if self.mode != Mode::Interactive
+            || previous.meshes.len() != scene.meshes.len()
+            || (!Arc::ptr_eq(&previous.curves, &scene.curves) && previous.curves != scene.curves)
+            || self.mesh_ranges.len() != scene.meshes.len()
+        {
+            return Ok(false);
+        }
+        let mut updates = Vec::new();
+        for (index, (old, mesh)) in previous.meshes.iter().zip(&scene.meshes).enumerate() {
+            if old == mesh {
+                continue;
+            }
+            if old.points.len() != mesh.points.len()
+                || old.indices != mesh.indices
+                || old.face_counts != mesh.face_counts
+                || old.reverse_orientation != mesh.reverse_orientation
+            {
+                return Ok(false);
+            }
+            let mut records = Self::mesh_records(scene, mesh)?;
+            if records.len() != self.mesh_ranges[index].len() {
+                return Ok(false);
+            }
+            for record in &mut records {
+                record.material[3] = f32::from_bits(index as u32);
+            }
+            let positions: Vec<[f32; 3]> = records
+                .iter()
+                .flat_map(|t| {
+                    [
+                        t.a[..3].try_into().unwrap(),
+                        t.b[..3].try_into().unwrap(),
+                        t.c[..3].try_into().unwrap(),
+                    ]
+                })
+                .collect();
+            updates.push((index, records, positions));
+        }
+        if updates.is_empty() {
+            return Ok(false);
+        }
+        let started = std::time::Instant::now();
+        let mut uploaded = 0;
+        let chunk = scene.settings.upload_chunk_mib as usize * 1024 * 1024;
+        for (index, records, positions) in &updates {
+            let start = self.mesh_ranges[*index].start;
+            let bytes = bytemuck::cast_slice(records);
+            self.scene_buffers[0].upload_staged_range(
+                bytes,
+                chunk,
+                (start * std::mem::size_of::<crate::scene::Triangle>()) as u64,
+            )?;
+            self.scene_buffers[3].upload_staged_range(
+                bytemuck::cast_slice(positions),
+                chunk,
+                (start * 36) as u64,
+            )?;
+            uploaded += bytes.len() + positions.len() * 12;
+        }
+        let data = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                device_address: self.scene_buffers[3].address(),
+            })
+            .vertex_stride(12)
+            .max_vertex((self.mesh_triangles * 3).saturating_sub(1))
+            .index_type(vk::IndexType::NONE_KHR);
+        self.blas.as_ref().unwrap().refit(
+            vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(vk::GeometryFlagsKHR::empty())
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: data }),
+        )?;
+        let data = vk::AccelerationStructureGeometryInstancesDataKHR::default().data(
+            vk::DeviceOrHostAddressConstKHR {
+                device_address: self.scene_buffers[4].address(),
+            },
+        );
+        self.tlas.as_ref().unwrap().refit(
+            vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { instances: data }),
+        )?;
+        if std::env::var_os("LAVA_TRACE").is_some() {
+            eprintln!("Lava mesh refit: meshes={}, uploaded={} bytes, curve uploads=0, curve BLAS builds=0, BLAS=refit TLAS=refit, commit_ms={:.3}, total_ms={:.3}", updates.len(), uploaded, started.elapsed().as_secs_f64()*1000., preparation_started.elapsed().as_secs_f64()*1000.);
+        }
+        Ok(true)
+    }
+    pub(crate) fn set_upload_chunk_mib(&mut self, value: u32) -> Result<()> {
+        let mut settings = self.settings;
+        settings.upload_chunk_mib = value;
+        settings.validate()?;
+        self.settings.upload_chunk_mib = value;
         Ok(())
     }
     pub(crate) fn update_materials(&mut self, scene: &Scene) -> Result<()> {
@@ -741,6 +958,9 @@ impl Renderer {
                 (13, &self.scene_buffers[5]),
                 (14, &self.material_luts),
                 (17, &self.sample_primes),
+                // Disabled specialization in production; profiler replaces this binding.
+                (21, &self.passes[1].scratch[2]),
+                (22, &self.passes[1].scratch[2]),
             ] {
                 let infos = [vk::DescriptorBufferInfo::default()
                     .buffer(buffer.raw)
@@ -967,7 +1187,7 @@ impl Renderer {
                                 &[],
                                 &[],
                             );
-                            device.raw.cmd_fill_buffer(cmd, control.raw, 0, 32, 0);
+                            device.raw.cmd_fill_buffer(cmd, control.raw, 0, 48, 0);
                             let filled = [vk::MemoryBarrier::default()
                                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                                 .dst_access_mask(
@@ -1031,6 +1251,24 @@ impl Renderer {
                                     &[],
                                     &[],
                                 );
+                                if self.reorder_rays {
+                                    device.raw.cmd_bind_pipeline(
+                                        cmd,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        self.passes[1].reorder_pipeline.unwrap(),
+                                    );
+                                    device.raw.cmd_dispatch_indirect(cmd, control.raw, 32);
+                                    device.raw.cmd_pipeline_barrier(
+                                        cmd,
+                                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                                        vk::PipelineStageFlags::COMPUTE_SHADER
+                                            | vk::PipelineStageFlags::DRAW_INDIRECT,
+                                        vk::DependencyFlags::empty(),
+                                        &wave,
+                                        &[],
+                                        &[],
+                                    );
+                                }
                                 device.raw.cmd_bind_pipeline(
                                     cmd,
                                     vk::PipelineBindPoint::COMPUTE,
@@ -1154,6 +1392,9 @@ impl Drop for Renderer {
                 if let Some(prepare) = p.prepare_pipeline {
                     self.device.raw.destroy_pipeline(prepare, None);
                 }
+                if let Some(reorder) = p.reorder_pipeline {
+                    self.device.raw.destroy_pipeline(reorder, None);
+                }
             }
             self.device
                 .raw
@@ -1175,10 +1416,11 @@ mod path_tests {
     };
     fn fixture() -> Scene {
         Scene {
-            curves: Vec::new(),
+            curves: Default::default(),
             settings: IntegratorSettings {
                 textures: crate::texture::TextureMode::Original,
                 visibility: Default::default(),
+                upload_chunk_mib: 16,
                 diffuse_depth: 1,
                 reflection_depth: 0,
                 refraction_depth: 0,
@@ -2291,12 +2533,411 @@ mod path_tests {
         println!("MIS={mis}, RR={rr}, reference={expected}, mixed={mixture}, mirror={reflected}, glass={transmitted}, compacted peak={peak}/256");
     }
     #[test]
+    #[ignore = "requires hardware ray queries; visibility equivalence and isolated GPU timestamp comparison"]
+    fn curve_polygon_first_visibility_matches_unified_and_reports_timings() {
+        let mut renderer = Renderer::new(128, 128, Mode::Final, None).unwrap();
+        let device = renderer.device.clone();
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/visibility.spv"
+        ))))
+        .unwrap();
+        let (reference, queries) = unsafe {
+            let module = device
+                .raw
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                .unwrap();
+            let entries = [vk::SpecializationMapEntry::default()
+                .constant_id(50)
+                .offset(0)
+                .size(4)];
+            let enabled = 1u32.to_ne_bytes();
+            let specialization = vk::SpecializationInfo::default()
+                .map_entries(&entries)
+                .data(&enabled);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .specialization_info(&specialization);
+            let pipeline = device
+                .raw
+                .create_compute_pipelines(
+                    renderer.pipeline_cache.raw,
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(renderer.layout)],
+                    None,
+                )
+                .unwrap()[0];
+            device.raw.destroy_shader_module(module, None);
+            let queries = device
+                .raw
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+                .unwrap();
+            (pipeline, queries)
+        };
+        let props = unsafe {
+            device
+                .instance
+                .raw
+                .get_physical_device_properties(device.physical)
+        };
+        let families = unsafe {
+            device
+                .instance
+                .raw
+                .get_physical_device_queue_family_properties(device.physical)
+        };
+        let bits = families[device.queue_family as usize].timestamp_valid_bits;
+        assert!(bits > 0);
+        let tick_mask = u64::MAX >> (64 - bits);
+        let measure = |renderer: &Renderer, pipeline, repeats| {
+            let mut push: Push = bytemuck::Zeroable::zeroed();
+            push.width = renderer.width;
+            push.height = renderer.height;
+            push.mesh_triangles = renderer.mesh_triangles;
+            push.curve_count = renderer.curve_count;
+            push.sampling_mode = 1;
+            push.target_samples = 16;
+            device
+                .submit(|cmd| unsafe {
+                    device.raw.cmd_reset_query_pool(cmd, queries, 0, 2);
+                    device.raw.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        renderer.layout,
+                        0,
+                        &[renderer.set],
+                        &[],
+                    );
+                    device.raw.cmd_push_constants(
+                        cmd,
+                        renderer.layout,
+                        device.shader_stages(),
+                        0,
+                        bytemuck::bytes_of(&push),
+                    );
+                    device
+                        .raw
+                        .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    device.raw.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        queries,
+                        0,
+                    );
+                    for _ in 0..repeats {
+                        device.raw.cmd_dispatch(
+                            cmd,
+                            renderer.width.div_ceil(8),
+                            renderer.height.div_ceil(8),
+                            1,
+                        );
+                        device.raw.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)],
+                            &[],
+                            &[],
+                        );
+                    }
+                    device.raw.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        queries,
+                        1,
+                    );
+                })
+                .unwrap();
+            let mut ticks = [0u64; 2];
+            unsafe {
+                device
+                    .raw
+                    .get_query_pool_results(
+                        queries,
+                        0,
+                        &mut ticks,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .unwrap();
+            }
+            (ticks[1].wrapping_sub(ticks[0]) & tick_mask) as f64
+                * props.limits.timestamp_period as f64
+                / (1e6 * repeats as f64)
+        };
+        // A single object containing a dense, layered bundle of 4096 segments.
+        let mut scene = fixture();
+        scene.lights.clear();
+        scene.camera.transform =
+            glam::Mat4::from_translation(glam::Vec3::new(0., 0., 3.)).to_cols_array();
+        scene.camera.horizontal_aperture = 2.4;
+        scene.camera.vertical_aperture = 2.4;
+        let mut points = Vec::new();
+        for z in 0..64 {
+            for x in 0..64 {
+                let px = (x as f32 - 31.5) / 32.;
+                let pz = -0.2 - z as f32 * 0.02;
+                points.extend([[px, -1., pz], [px, 1., pz]]);
+            }
+        }
+        Arc::make_mut(&mut scene.curves).push(
+            serde_json::from_value(serde_json::json!({
+                "points":points,"counts":vec![2;4096],"radius":0.012
+            }))
+            .unwrap(),
+        );
+        for scenario in ["occluded", "exposed", "cutout_dof"] {
+            if scenario == "exposed" {
+                for p in &mut scene.meshes[0].points {
+                    p[2] = -3.;
+                }
+            }
+            if scenario == "cutout_dof" {
+                for p in &mut scene.meshes[0].points {
+                    p[2] = 0.;
+                }
+                scene.meshes[0].material.openpbr = Some(crate::material::OpenPbrSurface {
+                    geometry_opacity: 0.35,
+                    ..Default::default()
+                });
+                scene.camera.orthographic = false;
+                scene.camera.f_stop = 2.;
+                scene.camera.focus_distance = 3.;
+            }
+            renderer.set_scene(&scene).unwrap();
+            renderer.refresh_textures().unwrap();
+            // Warm both products before timing and compare exactly the same rays.
+            measure(&renderer, renderer.passes[0].pipeline, 1);
+            let unified = visibility_snapshot(&renderer);
+            measure(&renderer, reference, 1);
+            let bounded = visibility_snapshot(&renderer);
+            for (a, b) in bounded.iter().zip(&unified) {
+                assert_eq!(
+                    a[0].to_bits(),
+                    b[0].to_bits(),
+                    "primitive mismatch {scenario}"
+                );
+                for k in 1..4 {
+                    assert!(
+                        (a[k] - b[k]).abs() < 1e-4,
+                        "hit mismatch {scenario}: {a:?}/{b:?}"
+                    );
+                }
+                assert_eq!(
+                    &a[4..].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    &b[4..].iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            // Alternate order and take medians to reduce clock/order bias.
+            let mut unified_times = Vec::new();
+            let mut bounded_times = Vec::new();
+            for round in 0..9 {
+                if round % 2 == 0 {
+                    unified_times.push(measure(&renderer, renderer.passes[0].pipeline, 16));
+                    bounded_times.push(measure(&renderer, reference, 16));
+                } else {
+                    bounded_times.push(measure(&renderer, reference, 16));
+                    unified_times.push(measure(&renderer, renderer.passes[0].pipeline, 16));
+                }
+            }
+            unified_times.sort_by(f64::total_cmp);
+            bounded_times.sort_by(f64::total_cmp);
+            let before = unified_times[4];
+            let after = bounded_times[4];
+            println!(
+                "curve visibility {scenario}: unified={before:.3} ms polygon-first={after:.3} ms"
+            );
+        }
+        unsafe {
+            device.raw.destroy_pipeline(reference, None);
+            device.raw.destroy_query_pool(queries, None);
+        }
+    }
+    #[test]
+    #[ignore = "requires hardware Vulkan; mesh refits retain static curve resources and match rebuilds"]
+    fn mesh_deformation_refits_preserve_static_resources_and_match_rebuilds() {
+        for visibility in [
+            crate::integrator::VisibilityMode::RayQuery,
+            crate::integrator::VisibilityMode::Raster,
+        ] {
+            let mut scene = fixture();
+            scene.settings.visibility = visibility;
+            scene.camera.horizontal_aperture = 4.;
+            scene.camera.vertical_aperture = 3.;
+            scene.camera.transform[14] = 5.;
+            scene.meshes[0].points =
+                vec![[-1., -1., 0.], [0., -1., 0.], [0., 1., 0.], [-1., 1., 0.]];
+            let mut other = scene.meshes[0].clone();
+            for p in &mut other.points {
+                p[0] += 1.5;
+            }
+            other.color = [0.1, 0.8, 0.2];
+            scene.meshes.push(other);
+            Arc::make_mut(&mut scene.curves).push(
+                serde_json::from_value(serde_json::json!({
+                    "points":[[-1.5,-1.,0.5],[-1.5,1.,0.5]],"counts":[2],"radius":0.1
+                }))
+                .unwrap(),
+            );
+            let mut renderer = Renderer::new(48, 32, Mode::Interactive, None).unwrap();
+            renderer.set_scene(&scene).unwrap();
+            let handles = (
+                renderer.scene_buffers[0].raw,
+                renderer.scene_buffers[3].raw,
+                renderer.scene_buffers[4].raw,
+                renderer.blas.as_ref().unwrap().raw,
+                renderer.tlas.as_ref().unwrap().raw,
+            );
+            let curves = renderer.curve_blas.clone();
+            let mut reference = Renderer::new(48, 32, Mode::Interactive, None).unwrap();
+            let mut old_pixels = renderer.render_batch(1, 0.).unwrap();
+            for frame in 1..=4 {
+                let previous = scene.clone();
+                assert!(Arc::ptr_eq(&previous.curves, &scene.curves));
+                // Change the second object's bounds, testing the nonzero upload and material-ID offsets.
+                for p in &mut scene.meshes[1].points {
+                    p[0] -= 0.15;
+                    p[2] += 0.1;
+                }
+                scene.meshes[1].normals = vec![[0., 0.2, 0.98]; 4];
+                assert!(renderer.try_refit_meshes(&previous, &scene).unwrap());
+                assert_eq!(
+                    handles,
+                    (
+                        renderer.scene_buffers[0].raw,
+                        renderer.scene_buffers[3].raw,
+                        renderer.scene_buffers[4].raw,
+                        renderer.blas.as_ref().unwrap().raw,
+                        renderer.tlas.as_ref().unwrap().raw
+                    )
+                );
+                assert!(Arc::ptr_eq(&curves[0], &renderer.curve_blas[0]));
+                renderer.update_scene_parameters(&scene).unwrap();
+                assert_eq!(renderer.samples(), 0);
+                let pixels = renderer.render_batch(1, 0.).unwrap();
+                reference.set_scene(&scene).unwrap();
+                let expected = reference.render_batch(1, 0.).unwrap();
+                let error = pixels
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    error < 0.0001,
+                    "{visibility:?} frame {frame}: refit/rebuild error {error}"
+                );
+                assert_ne!(pixels, old_pixels, "deformation did not change the image");
+                old_pixels = pixels;
+            }
+            let previous = scene.clone();
+            scene.meshes[1].face_counts.push(3);
+            scene.meshes[1].indices.extend([0, 1, 2]);
+            assert!(!renderer.try_refit_meshes(&previous, &scene).unwrap());
+            scene = previous.clone();
+            Arc::make_mut(&mut scene.curves)[0].points[0][0] += 0.2;
+            assert!(!renderer.try_refit_meshes(&previous, &scene).unwrap());
+        }
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; immutable per-object curve BLAS reuse"]
+    fn unchanged_curve_objects_reuse_blas_across_scene_rebuilds() {
+        let device = Device::new(Instance::new().unwrap(), None).unwrap();
+        let mut scene = fixture();
+        let curve: crate::curves::Curves = serde_json::from_value(serde_json::json!({
+            "points": [[0.,-1.,0.], [0.,1.,0.]], "counts": [2], "radius": 0.1
+        }))
+        .unwrap();
+        scene.curves = vec![curve.clone(), curve].into();
+        for p in &mut Arc::make_mut(&mut scene.curves)[1].points {
+            p[0] += 2.;
+        }
+        let first = Renderer::prepare_geometry(device.clone(), &scene, Mode::Interactive).unwrap();
+        assert_eq!(first.curve_blas.len(), 2);
+        // Changing polygon count also changes all curve primitive/material offsets.
+        scene.meshes.push(scene.meshes[0].clone());
+        Arc::make_mut(&mut scene.curves)[0].material.metallic = 0.7;
+        Arc::make_mut(&mut scene.curves)[0].color = [0.1, 0.2, 0.3];
+        let second = Renderer::prepare_geometry(device.clone(), &scene, Mode::Interactive).unwrap();
+        assert!(Arc::ptr_eq(&first.curve_blas[0], &second.curve_blas[0]));
+        assert!(Arc::ptr_eq(&first.curve_blas[1], &second.curve_blas[1]));
+        Arc::make_mut(&mut scene.curves)[0].radius[0] *= 2.;
+        let third = Renderer::prepare_geometry(device.clone(), &scene, Mode::Interactive).unwrap();
+        assert!(!Arc::ptr_eq(&second.curve_blas[0], &third.curve_blas[0]));
+        assert!(Arc::ptr_eq(&second.curve_blas[1], &third.curve_blas[1]));
+        let final_geometry = Renderer::prepare_geometry(device, &scene, Mode::Final).unwrap();
+        assert!(!Arc::ptr_eq(
+            &third.curve_blas[1],
+            &final_geometry.curve_blas[1]
+        ));
+        let released = Arc::downgrade(&third.curve_blas[0]);
+        drop(third);
+        assert!(
+            released.upgrade().is_none(),
+            "cache retained unused GPU memory"
+        );
+    }
+    #[test]
+    #[ignore = "requires hardware ray queries; polygon-first curve occlusion and cutouts"]
+    fn polygon_depth_bounds_curves_without_hiding_front_or_cutout_hits() {
+        let mut renderer = Renderer::new(8, 8, Mode::Final, None).unwrap();
+        renderer.linear_output = true;
+        let mut scene = fixture();
+        scene.lights.clear();
+        scene.settings.diffuse_depth = 0;
+        Arc::make_mut(&mut scene.curves).push(
+            serde_json::from_value(serde_json::json!({
+                "points": [[0.,-1.,-1.], [0.,1.,-1.]], "counts": [2], "radius": 0.1,
+                "material": {"openpbr": {"base_weight":0., "specular_weight":0.,
+                    "emission_luminance":2., "emission_color":[1.,1.,1.]}}
+            }))
+            .unwrap(),
+        );
+        assert!(
+            mean(&mut renderer, &scene, 1) < 0.05,
+            "curve behind polygon leaked"
+        );
+        assert!(visibility_snapshot(&renderer)
+            .iter()
+            .all(|h| (1..=2).contains(&h[0].to_bits())));
+        scene.meshes[0].material.openpbr = Some(crate::material::OpenPbrSurface {
+            geometry_opacity: 0.,
+            ..Default::default()
+        });
+        assert!(
+            (mean(&mut renderer, &scene, 1) - 2.).abs() < 1e-4,
+            "cutout occluded curve"
+        );
+        scene.meshes[0].material.openpbr = None;
+        for p in &mut Arc::make_mut(&mut scene.curves)[0].points {
+            p[2] = 0.25;
+        }
+        assert!(
+            (mean(&mut renderer, &scene, 1) - 2.).abs() < 1e-4,
+            "front curve was culled"
+        );
+        scene.camera.near = 0.4;
+        assert!(
+            mean(&mut renderer, &scene, 1) < 0.05,
+            "near-clipped curve survived"
+        );
+    }
+    #[test]
     #[ignore = "requires hardware ray queries and optional EXT mesh shaders; analytic curves in both visibility paths"]
     fn curves_render_round_surfaces_in_query_and_mesh_visibility() {
         let mut scene = fixture();
         scene.meshes.clear();
         scene.lights.clear();
-        scene.curves.push(crate::curves::Curves {
+        Arc::make_mut(&mut scene.curves).push(crate::curves::Curves {
             points: vec![[0., -1., 0.], [0., 1., 0.]],
             counts: vec![2],
             basis: "linear".into(),
@@ -2376,13 +3017,13 @@ mod path_tests {
             let clear = mean(&mut renderer, &scene, 16);
             assert!(clear > 0.7);
             let curve:crate::curves::Curves=serde_json::from_value(serde_json::json!({"points":[[0.,-1.,1.],[0.,1.,1.]],"counts":[2],"radius":[0.01,0.2]})).unwrap();
-            scene.curves.push(curve);
+            Arc::make_mut(&mut scene.curves).push(curve);
             let blocked = mean(&mut renderer, &scene, 16);
             assert!(
                 blocked < clear * 0.1,
                 "procedural curve shadow missing: {blocked}/{clear}"
             );
-            for p in &mut scene.curves[0].points {
+            for p in &mut Arc::make_mut(&mut scene.curves)[0].points {
                 p[0] = 0.15;
             }
             let empty_box = mean(&mut renderer, &scene, 16);
@@ -2390,19 +3031,20 @@ mod path_tests {
                 (empty_box - clear).abs() < 0.025,
                 "AABB falsely shadowed tapered curve: {empty_box}/{clear}"
             );
-            for p in &mut scene.curves[0].points {
+            for p in &mut Arc::make_mut(&mut scene.curves)[0].points {
                 p[0] = 0.;
             }
             scene.meshes[0].material.metallic = 1.;
             scene.meshes[0].color = [1.; 3];
             scene.settings.reflection_depth = 1;
-            scene.curves[0].material.openpbr = Some(crate::material::OpenPbrSurface {
-                base_weight: 0.,
-                specular_weight: 0.,
-                emission_luminance: 2.,
-                emission_color: [1., 0.5, 0.25],
-                ..Default::default()
-            });
+            Arc::make_mut(&mut scene.curves)[0].material.openpbr =
+                Some(crate::material::OpenPbrSurface {
+                    base_weight: 0.,
+                    specular_weight: 0.,
+                    emission_luminance: 2.,
+                    emission_color: [1., 0.5, 0.25],
+                    ..Default::default()
+                });
             scene.lights.clear();
             let reflected = mean(&mut renderer, &scene, 4);
             assert!(
@@ -2418,7 +3060,7 @@ mod path_tests {
         scene.meshes.clear();
         scene.lights.clear();
         scene.settings.visibility = crate::integrator::VisibilityMode::Raster;
-        scene.curves.push(serde_json::from_value(serde_json::json!({"points":[[0.,-1.,0.],[0.,1.,0.]],"counts":[2],"radius":0.000001,"material":{"openpbr":{"base_weight":0.,"specular_weight":0.,"emission_luminance":2.,"emission_color":[1.,1.,1.]}}})).unwrap());
+        Arc::make_mut(&mut scene.curves).push(serde_json::from_value(serde_json::json!({"points":[[0.,-1.,0.],[0.,1.,0.]],"counts":[2],"radius":0.000001,"material":{"openpbr":{"base_weight":0.,"specular_weight":0.,"emission_luminance":2.,"emission_color":[1.,1.,1.]}}})).unwrap());
         let mut viewport = Renderer::new(1, 1, Mode::Interactive, None).unwrap();
         viewport.linear_output = true;
         if !viewport.device.mesh_shader {
@@ -3091,3 +3733,11 @@ mod path_tests {
         assert_eq!(final_frame.samples(), 4);
     }
 }
+
+#[cfg(test)]
+#[path = "renderer_profile.rs"]
+mod profiling;
+
+#[cfg(test)]
+#[path = "renderer_upload_bench.rs"]
+mod upload_benchmark;

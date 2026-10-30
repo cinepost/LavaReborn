@@ -67,3 +67,7 @@ add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/houdini/otls/lava_render_settings
     COMMENT "Building Lava Solaris digital assets")
 add_custom_target(lava_houdini_assets ALL DEPENDS "${CMAKE_BINARY_DIR}/houdini/otls/lava_render_settings.hda" "${CMAKE_BINARY_DIR}/houdini/otls/lava_light_properties.hda")
 install(FILES "${CMAKE_BINARY_DIR}/houdini/otls/lava_render_settings.hda" "${CMAKE_BINARY_DIR}/houdini/otls/lava_light_properties.hda" DESTINATION houdini/otls)
+
+# Numeric scene serialization regression; no Houdini or GPU dependencies.
+add_executable(lava_json_writer_smoke tests/json_writer_smoke.cpp)
+target_compile_options(lava_json_writer_smoke PRIVATE -UNDEBUG)

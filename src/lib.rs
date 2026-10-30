@@ -19,3 +19,5 @@ mod sampling;
 
 pub mod curves;
 pub mod texture;
+
+mod mesh_transport;

@@ -156,6 +156,73 @@ pub unsafe extern "C" fn lava_submit(
         }
     }
 }
+/// Submit meshes while sharing the previous immutable curve snapshot.
+/// # Safety
+/// Session must be live and JSON must be NUL terminated. Calls serialized by caller.
+#[no_mangle]
+pub unsafe extern "C" fn lava_update_meshes(
+    session: *mut Session,
+    json: *const c_char,
+    width: u32,
+    height: u32,
+    samples: u32,
+    exposure: f32,
+) -> u64 {
+    if session.is_null() || json.is_null() {
+        return 0;
+    }
+    let s = &mut *session;
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<u64> {
+            let started = std::time::Instant::now();
+            let mut scene: Scene = serde_json::from_str(CStr::from_ptr(json).to_str()?)?;
+            anyhow::ensure!(scene.curves.is_empty(), "mesh updates must omit curves");
+            let previous = s
+                .last_request
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("full scene required before mesh updates"))?;
+            anyhow::ensure!(
+                previous.mode == Mode::Interactive,
+                "mesh updates require interactive mode"
+            );
+            scene.curves = previous.scene.curves.clone();
+            if std::env::var_os("LAVA_TRACE").is_some() {
+                eprintln!(
+                    "Lava mesh parse: ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.
+                );
+            }
+            let worker = s.worker.get_or_insert_with(crate::worker::Worker::new);
+            let request = crate::worker::Request {
+                scene: std::sync::Arc::new(scene),
+                view: None,
+                width,
+                height,
+                mode: Mode::Interactive,
+                samples,
+                exposure,
+                gpu_output: s.interop,
+            };
+            let revision = worker.submit(request.clone())?;
+            s.last_request = Some(request);
+            s.last_revision = revision;
+            Ok(revision)
+        }));
+    match result {
+        Ok(Ok(revision)) => {
+            s.error = CString::default();
+            revision
+        }
+        Ok(Err(e)) => {
+            s.error(format!("{e:#}"));
+            0
+        }
+        Err(_) => {
+            s.error("submit panicked".into());
+            0
+        }
+    }
+}
 /// Update only camera/lights/settings while retaining immutable geometry.
 /// # Safety
 /// Same requirements as lava_submit. Only valid after a successful full submit.

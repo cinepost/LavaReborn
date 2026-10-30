@@ -8,6 +8,7 @@
 #include "light_bvh.glsl"
 #include "camera.glsl"
 #include "queue.glsl"
+
 #include "materials/visibility.glsl"
 #include "query.glsl"
 #include "materials/surface.glsl"
@@ -24,14 +25,19 @@ vec3 reducedAnalyticReflection(vec3 multiplier) {
  return multiplier*min(1.,16./max(peak,1e-20));
 }
 float epsilonAt(vec3 p) {return max(1e-4,1e-6*max(abs(p.x),max(abs(p.y),abs(p.z))));}
+#include "shadow_query.glsl"
+#include "shadow_profile.glsl"
+layout(constant_id=51) const uint shadowProfileMode=0u;
+uint shadowProfilePixel;
 bool visible(vec3 origin,vec3 direction,float distance,uint sampledLight) {
-  rayQueryEXT q;
-  rayQueryInitializeEXT(q,world,gl_RayFlagsTerminateOnFirstHitEXT,255,origin,1e-5,direction,distance);
-  while(rayQueryProceedEXT(q)){
-   confirmCandidate(q,1e-5,distance,false);
-  }
-  if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT)return false;
-  uint emitter;return !traceLights(origin,direction,1e-5,distance,emitter,sampledLight);
+ if(shadowProfileMode==2u)return shadowRecords[shadowProfilePixel].result.x!=0u;
+ bool answer=traceShadow(origin,direction,distance,sampledLight);
+ if(shadowProfileMode==1u){
+  shadowRecords[shadowProfilePixel].originDistance=vec4(origin,distance);
+  shadowRecords[shadowProfilePixel].directionLight=vec4(direction,uintBitsToFloat(sampledLight));
+  shadowRecords[shadowProfilePixel].result=uvec4(uint(answer),0,1,0);
+ }
+ return answer;
 }
 // Offset the origin first, then construct the finite segment to the sampled
 // point. Reusing the unoffset direction/distance makes an analytic rectangle
@@ -164,6 +170,7 @@ vec3 surfaceNextEvent(vec3 p,vec3 n,MaterialSurface surface,vec3 throughput,inou
 }
 bool scatter(inout PathRay ray,uint primitive,vec2 bary) {
  samplingPixel=ray.state.x;
+ if(shadowProfileMode!=0u)shadowProfilePixel=ray.state.x;
  uint id=materialId(primitive);
  if(materials[id].values[0].x==0.)return scatterLegacy(ray,primitive,bary);
  Triangle t=hitTriangle(primitive,bary,ray.originPdf.xyz,ray.directionDelta.xyz);
@@ -220,13 +227,19 @@ void main() {
     }
   } else if(index<counts[pc.queueParity]) {
     ray=pc.queueParity==0u?raysA[index]:raysB[index];
-    rayQueryEXT q;
-    rayQueryInitializeEXT(q,world,0u,255,ray.originPdf.xyz,1e-5,ray.directionDelta.xyz,1e30);
-    while(rayQueryProceedEXT(q)){
-   confirmCandidate(q,1e-5,1e30,false);
-  }
-    bool hit=rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
-    float distance=hit?rayQueryGetIntersectionTEXT(q,true):1e30;uint emitter;
+    bool hit;float distance;uint primitive=0u;vec2 bary=vec2(0);uint emitter;
+    if(shadowProfileMode==2u){
+      uvec4 record=continuationRecords[ray.state.x];hit=record.x!=0u;
+      primitive=record.x-1u;bary=uintBitsToFloat(record.yz);distance=uintBitsToFloat(record.w);
+    }else{
+      rayQueryEXT q;
+      rayQueryInitializeEXT(q,world,0u,255,ray.originPdf.xyz,1e-5,ray.directionDelta.xyz,1e30);
+      while(rayQueryProceedEXT(q))confirmCandidate(q,1e-5,1e30,false);
+      hit=rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+      distance=hit?rayQueryGetIntersectionTEXT(q,true):1e30;
+      if(hit){primitive=queryPrimitive(q);bary=queryCoordinates(q);}
+      if(shadowProfileMode==1u)continuationRecords[ray.state.x]=uvec4(hit?primitive+1u:0u,floatBitsToUint(bary),floatBitsToUint(distance));
+    }
     if(traceLights(ray.originPdf.xyz,ray.directionDelta.xyz,1e-5,distance,emitter)) {
       vec3 target=ray.originPdf.xyz+distance*ray.directionDelta.xyz;
       float weight=ray.directionDelta.w>0.?1.:powerWeight(ray.originPdf.w,lightPdf(emitter,ray.originPdf.xyz,target,ray.directionDelta.xyz));
@@ -234,10 +247,8 @@ void main() {
       if(ray.state.w==2u)multiplier=reducedAnalyticReflection(multiplier);
       radiance[ray.state.x].rgb+=multiplier*emission(emitter);
     } else if(!hit)radiance[ray.state.x].rgb+=ray.throughput.rgb*environment();
-    else alive=scatter(ray,queryPrimitive(q),queryCoordinates(q));
+    else alive=scatter(ray,primitive,bary);
   }
-  // Subgroup (warp/wave) compaction: one global reservation per subgroup.
-  // Inactive lanes never enter the next bounce's indirect dispatch.
   uvec4 activeMask=subgroupBallot(alive);uint activeCount=subgroupBallotBitCount(activeMask);
   uint outputQueue=pc.rayPhase==0u?0u:1u-pc.queueParity;
   uint base=0u;

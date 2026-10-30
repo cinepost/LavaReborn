@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "queue.glsl"
+#include "queue_reorder.glsl"
+layout(local_size_x=256) in;
+shared PathRay payload[256];
+shared uvec2 keys[256];
+void main() {
+ uint first=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*256u;
+ uint n=counts[pc.queueParity];
+ // Uniform within each workgroup; small late queues avoid sorting altogether.
+ if(n<1024u||first>=n)return;
+ uint liveCount=min(256u,n-first);if(liveCount<16u)return;
+ uint lane=gl_LocalInvocationIndex,index=first+lane;
+ if(lane<liveCount) {
+  PathRay ray=pc.queueParity==0u?raysA[index]:raysB[index];
+  payload[lane]=ray;keys[lane]=uvec2(coherenceKey(ray),lane);
+ }else keys[lane]=uvec2(0xffffffffu,lane);
+ barrier();
+ // Sort only keys and indices; move each complete path record once.
+ for(uint size=2u;size<=256u;size<<=1u)for(uint stride=size>>1u;stride>0u;stride>>=1u) {
+  uvec2 a=keys[lane],b=keys[lane^stride];
+  bool takeMin=((lane&size)==0u)==((lane&stride)==0u);
+  uvec2 selected=(keyLess(a,b)==takeMin)?a:b;
+  barrier();keys[lane]=selected;barrier();
+ }
+ if(lane<liveCount) {
+  PathRay ray=payload[keys[lane].y];
+  if(pc.queueParity==0u)raysA[index]=ray;else raysB[index]=ray;
+ }
+}

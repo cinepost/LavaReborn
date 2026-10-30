@@ -12,6 +12,7 @@ resolution=node.evalParmTuple('resolution')
 values={
  'lava:visibility':(Sdf.ValueTypeNames.String,node.evalParm('visibility')),
  'lava:textures':(Sdf.ValueTypeNames.String,node.evalParm('textures') if node.parm('textures') else 'original'),
+ 'lava:uploadChunkMiB':(Sdf.ValueTypeNames.Int,int(node.evalParm('upload_chunk_mib')) if node.parm('upload_chunk_mib') else 16),
  'lava:mode':(Sdf.ValueTypeNames.String,node.evalParm('mode')),
  'lava:samples':(Sdf.ValueTypeNames.Int,node.evalParm('samples')),
  'lava:exposure':(Sdf.ValueTypeNames.Float,node.evalParm('exposure')),
@@ -52,7 +53,7 @@ def build(args):
     folder.addParmTemplate(hou.StringParmTemplate('visibility','Visibility Generator',1,default_value=('ray_query',),menu_items=('ray_query','raster'),menu_labels=('Hardware Ray Queries','Hardware Rasterisation')))
     folder.addParmTemplate(hou.StringParmTemplate('textures','Textures',1,default_value=('original',),menu_items=('original','compressed','virtual'),menu_labels=('Original','Compressed (BC4/BC7)','Virtual (inactive)')))
     folder.addParmTemplate(hou.StringParmTemplate('mode','Render Mode',1,default_value=('interactive',),menu_items=('interactive','final'),menu_labels=('Interactive — viewport','Final — offline frame')))
-    folder.addParmTemplate(hou.IntParmTemplate('samples','Samples',1,default_value=(64,),min=1,max=1024,min_is_strict=True,help='Target after movement stops. Interactive images update before convergence.'))
+    folder.addParmTemplate(hou.IntParmTemplate('samples','Samples',1,default_value=(64,),min=1,max=1024,min_is_strict=True,max_is_strict=True,help='Target after movement stops. Interactive images update before convergence.'))
     folder.addParmTemplate(hou.FloatParmTemplate('exposure','Exposure (stops)',1,default_value=(0.,),min=-8,max=8,help='+1 doubles image brightness.'))
     folder.addParmTemplate(hou.ToggleParmTemplate('headlight','Automatic Headlight',default_value=True,help='Interactive headlight when the scene has no supported lights.'))
     depths=hou.FolderParmTemplate('path_depths','Path Depth Limits',folder_type=hou.folderType.Simple)
@@ -61,6 +62,9 @@ def build(args):
     depths.addParmTemplate(hou.IntParmTemplate('roulette_start','Russian Roulette Start Depth',1,default_value=(3,),min=0,max=96,min_is_strict=True,max_is_strict=True,help='Start after this many total bounces. Set above the sum of limits to disable roulette.'))
     depths.addParmTemplate(hou.ToggleParmTemplate('reduce_analytic_caustics','Reduce Analytic Light Caustics',default_value=False,help='Biased firefly reduction for reflected analytic-light contributions. Very sharp highlights can become dimmer. Diffuse lighting and emissive materials remain unchanged.'))
     folder.addParmTemplate(depths)
+    advanced=hou.FolderParmTemplate('advanced','Advanced',folder_type=hou.folderType.Simple)
+    advanced.addParmTemplate(hou.StringParmTemplate('upload_chunk_mib','Geometry Upload Chunk Size',1,default_value=('16',),menu_items=('16','32','64'),menu_labels=('16 MiB','32 MiB','64 MiB'),help='Staging chunk size for subsequent geometry uploads. Larger chunks can shorten scene update time but increase viewport frame delays. Does not reset accumulation.'))
+    folder.addParmTemplate(advanced)
     output=hou.FolderParmTemplate('scene_output','Camera and Output',folder_type=hou.folderType.Simple)
     output.addParmTemplate(hou.StringParmTemplate('camera_path','USD Camera',1,default_value=(camera,)))
     output.addParmTemplate(hou.IntParmTemplate('resolution','Output Resolution',2,default_value=(1920,1080),min=1,max=8192,min_is_strict=True))

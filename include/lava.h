@@ -18,8 +18,11 @@ int32_t lava_render(LavaSession *, const char *json, uint32_t width,
 uint64_t lava_submit(LavaSession *, const char *json, uint32_t width,
                      uint32_t height, bool final_mode, uint32_t samples,
                      float exposure);
-/* Interactive camera/light delta: JSON meshes must be empty; retain geometry.
- */
+/* Interactive mesh snapshot, retaining curves from the last full submission. */
+uint64_t lava_update_meshes(LavaSession *, const char *json, uint32_t width,
+                            uint32_t height, uint32_t samples, float exposure);
+/* Interactive camera/light delta: omit geometry and retain the current
+ * snapshot. */
 uint64_t lava_update_view(LavaSession *, const char *json, uint32_t width,
                           uint32_t height, uint32_t samples, float exposure);
 int64_t lava_poll(LavaSession *, uint64_t revision, float *output,

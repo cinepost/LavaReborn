@@ -122,16 +122,20 @@ impl Worker {
                         let display_only = current.as_ref().is_some_and(|(id, previous)| {
                             *id != revision
                                 && (Arc::ptr_eq(&previous.scene, &r.scene)
-                                    || previous.scene == r.scene)
+                                    || previous.scene.same_render_content(&r.scene))
                                 && previous.samples == r.samples
                                 && previous.gpu_output == r.gpu_output
                                 && parameters.as_ref().is_some_and(|p| {
-                                    p.parameters().settings == r.parameters().settings
+                                    p.parameters()
+                                        .settings
+                                        .same_render_settings(r.parameters().settings)
                                         && p.parameters().camera == r.parameters().camera
                                         && p.parameters().lights == r.parameters().lights
                                 })
                         });
                         if display_only {
+                            renderer
+                                .set_upload_chunk_mib(r.parameters().settings.upload_chunk_mib)?;
                             renderer.gpu_output = r.gpu_output;
                             current = Some((revision, request.clone()));
                             parameters = Some(request.clone());
@@ -154,6 +158,14 @@ impl Worker {
                                 {
                                     renderer.update_materials(&r.scene)?;
                                 }
+                                renderer.gpu_output = r.gpu_output;
+                                renderer.update_scene_parameters(r.parameters())?;
+                                current = Some((revision, request.clone()));
+                                parameters = Some(request.clone());
+                            } else if renderer
+                                .try_refit_meshes(&current.as_ref().unwrap().1.scene, &r.scene)?
+                            {
+                                renderer.update_materials(&r.scene)?;
                                 renderer.gpu_output = r.gpu_output;
                                 renderer.update_scene_parameters(r.parameters())?;
                                 current = Some((revision, request.clone()));
@@ -501,7 +513,9 @@ mod tests {
             let first = wait(&worker, revision, false, 4);
             let device = first.buffer.device.clone();
             let mut changed = (*request.scene).clone();
-            changed.meshes[0].points[0][0] += 0.1;
+            // Topology edits deliberately exercise the asynchronous rebuild path.
+            changed.meshes[0].face_counts.push(3);
+            changed.meshes[0].indices.extend([0, 1, 2]);
             request.scene = Arc::new(changed);
             worker.submit(request.clone()).unwrap();
             let until = Instant::now() + Duration::from_secs(5);
@@ -691,6 +705,28 @@ mod tests {
                 }
                 // Diagnostic reads above are explicit test requests, not worker presentation.
             }
+            // A performance-only setting must re-present existing history as well.
+            for chunk in [32, 64, 16] {
+                if let Some(view) = request.view.as_mut() {
+                    Arc::make_mut(view).settings.upload_chunk_mib = chunk;
+                } else {
+                    Arc::make_mut(&mut request.scene).settings.upload_chunk_mib = chunk;
+                }
+                let reads = crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed);
+                let revision = worker.submit(request.clone()).unwrap();
+                let frame = wait(&worker, revision, false, 8);
+                assert_eq!(
+                    frame.serial,
+                    previous_serial + 1,
+                    "upload policy restarted accumulation"
+                );
+                previous_serial = frame.serial;
+                assert_eq!(
+                    crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed),
+                    reads
+                );
+                assert_eq!(frame.read_color().unwrap(), original);
+            }
         }
     }
     #[test]
@@ -811,12 +847,17 @@ mod tests {
         request.samples = 2;
         let transfers = crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed);
 
-        Arc::make_mut(&mut request.scene).meshes[0].points[0][0] += 0.2;
+        Arc::make_mut(&mut request.scene).meshes[0]
+            .face_counts
+            .push(3);
+        Arc::make_mut(&mut request.scene).meshes[0]
+            .indices
+            .extend([0, 1, 2]);
         let obsolete = worker.submit(request.clone()).unwrap();
         started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let old = wait(&worker, obsolete, true, 5);
         assert!(old.serial > first_frame.serial);
-        // A newer topology version supersedes the held deformation build.
+        // A newer topology version supersedes the held topology build.
         Arc::make_mut(&mut request.scene).meshes[0]
             .face_counts
             .push(3);

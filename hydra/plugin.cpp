@@ -1,11 +1,13 @@
 // Hydra 1 render delegate adapter. Vulkan execution lives exclusively in Rust.
 #include "interop.h"
+#include "jsonWriter.h"
 #include "lava.h"
 #include "materialTextures.h"
 #include "meshNormals.h"
 #include "principledTextures.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +53,9 @@ std::string Vec(GfVec3d const &p) {
   o << std::setprecision(9) << '[' << p[0] << ',' << p[1] << ',' << p[2] << ']';
   return o.str();
 }
+lava_json::Writer &operator<<(lava_json::Writer &o, GfVec3d const &p) {
+  return o << '[' << p[0] << ',' << p[1] << ',' << p[2] << ']';
+}
 // Renderer primvars are transported by UsdImaging for both lights and meshes.
 bool BoolPrimvar(HdSceneDelegate *d, SdfPath const &id, char const *name,
                  bool fallback) {
@@ -72,6 +77,7 @@ struct State : HdRenderParam {
   std::mutex mutex;
   uint64_t generation = 0;
   uint64_t geometryGeneration = 0;
+  uint64_t curvesGeneration = 0;
   std::map<SdfPath, std::string> meshes, curves, lights, materials;
   std::map<SdfPath, SdfPath> meshMaterials;
 };
@@ -92,6 +98,7 @@ public:
   }
   void Sync(HdSceneDelegate *d, HdRenderParam *param, HdDirtyBits *bits,
             TfToken const &) override {
+    const auto syncStarted = std::chrono::steady_clock::now();
     auto *state = static_cast<State *>(param);
     if (!d->GetVisible(GetId())) {
       std::lock_guard<std::mutex> lock(state->mutex);
@@ -114,14 +121,13 @@ public:
     auto c = d->Get(GetId(), HdTokens->displayColor);
     if (c.IsHolding<VtVec3fArray>() && !c.UncheckedGet<VtVec3fArray>().empty())
       color = c.UncheckedGet<VtVec3fArray>()[0];
-    std::ostringstream o;
-    o << std::setprecision(9) << "{\"points\":[";
-    for (size_t i = 0; i < points.size(); i++) {
-      if (i)
-        o << ',';
-      o << Vec(transform.Transform(GfVec3d(points[i])));
-    }
-    o << "],\"face_counts\":[";
+    lava_json::Writer o(points.size() * 192 +
+                        topology.GetFaceVertexIndices().size() * 24);
+    o << "{\"points\":";
+    o.vectors<3>(points.size(), [&](size_t i) {
+      return transform.Transform(GfVec3d(points[i]));
+    });
+    o << ",\"face_counts\":[";
     auto counts = topology.GetFaceVertexCounts();
     for (size_t i = 0; i < counts.size(); i++) {
       if (i)
@@ -190,13 +196,10 @@ public:
         worldNormals.push_back(world);
       }
       if (valid && !normals.empty()) {
-        o << ",\"normals\":[";
-        for (size_t i = 0; i < worldNormals.size(); ++i) {
-          if (i)
-            o << ',';
-          o << Vec(worldNormals[i]);
-        }
-        o << "],\"normal_indices\":[";
+        o << ",\"normals\":";
+        o.vectors<3>(worldNormals.size(),
+                     [&](size_t i) { return worldNormals[i]; });
+        o << ",\"normal_indices\":[";
         for (size_t i = 0; i < corners.size(); ++i) {
           if (i)
             o << ',';
@@ -236,13 +239,9 @@ public:
         corners.push_back(static_cast<int>(index));
       }
       if (valid && !uv.empty()) {
-        o << ",\"texcoords\":[";
-        for (size_t i = 0; i < uv.size(); ++i) {
-          if (i)
-            o << ',';
-          o << '[' << uv[i][0] << ',' << uv[i][1] << ']';
-        }
-        o << "],\"texcoord_indices\":[";
+        o << ",\"texcoords\":";
+        o.vectors<2>(uv.size(), [&](size_t i) { return uv[i]; });
+        o << ",\"texcoord_indices\":[";
         for (size_t i = 0; i < corners.size(); ++i) {
           if (i)
             o << ',';
@@ -257,7 +256,7 @@ public:
       << ",\"render_light_geometry\":"
       << (BoolPrimvar(d, GetId(), "lava:renderLightGeometry", false) ? "true"
                                                                      : "false")
-      << ",\"color\":" << Vec(GfVec3d(color)) << '}';
+      << ",\"color\":" << GfVec3d(color) << '}';
     std::lock_guard<std::mutex> lock(state->mutex);
     auto serialized = o.str();
     auto materialId = d->GetMaterialId(GetId());
@@ -268,6 +267,12 @@ public:
       ++state->generation;
       ++state->geometryGeneration;
     }
+    if (std::getenv("LAVA_TRACE"))
+      std::fprintf(stderr, "Lava mesh sync: %s bytes=%zu ms=%.3f\n",
+                   GetId().GetText(), stored.size(),
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - syncStarted)
+                       .count());
     *bits = HdChangeTracker::Clean;
   }
 
@@ -296,6 +301,7 @@ public:
       if (state->curves.erase(GetId())) {
         ++state->generation;
         ++state->geometryGeneration;
+        ++state->curvesGeneration;
       }
       *bits = HdChangeTracker::Clean;
     };
@@ -457,6 +463,7 @@ public:
       state->meshMaterials[GetId()] = material;
       ++state->generation;
       ++state->geometryGeneration;
+      ++state->curvesGeneration;
     }
     *bits = HdChangeTracker::Clean;
   }
@@ -701,6 +708,7 @@ public:
       state->materials[GetId()] = json;
       ++state->generation;
       ++state->geometryGeneration;
+      ++state->curvesGeneration;
     }
     *bits = Clean;
   }
@@ -855,6 +863,7 @@ class Pass final : public HdRenderPass {
   std::shared_ptr<RenderSession> session = std::make_shared<RenderSession>();
   std::string previous;
   uint64_t sceneGeneration = ~uint64_t(0);
+  uint64_t sceneCurvesGeneration = ~uint64_t(0);
   std::string sceneMode;
   uint64_t revision = 0;
   bool traced = false;
@@ -951,7 +960,8 @@ public:
     {
       std::lock_guard<std::mutex> lock(state.mutex);
       state.meshes.erase(p->GetId());
-      state.curves.erase(p->GetId());
+      if (state.curves.erase(p->GetId()))
+        ++state.curvesGeneration;
       ++state.generation;
       ++state.geometryGeneration;
     }
@@ -973,8 +983,10 @@ public:
   void DestroySprim(HdSprim *p) override {
     {
       std::lock_guard<std::mutex> lock(state.mutex);
-      if (state.materials.erase(p->GetId()))
+      if (state.materials.erase(p->GetId())) {
         ++state.geometryGeneration;
+        ++state.curvesGeneration;
+      }
       state.lights.erase(p->GetId());
       ++state.generation;
     }
@@ -1001,6 +1013,8 @@ public:
             {"Rendering path", TfToken("lava:mode"),
              VtValue(std::string("interactive"))},
             {"Samples", TfToken("lava:samples"), VtValue(64)},
+            {"Geometry upload chunk size (MiB)", TfToken("lava:uploadChunkMiB"),
+             VtValue(16)},
             {"Exposure", TfToken("lava:exposure"), VtValue(0.f)},
             {"Texture mode", TfToken("lava:textures"),
              VtValue(std::string("original"))},
@@ -1062,6 +1076,8 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     << delegate->GetRenderSetting(TfToken("lava:textures"),
                                   std::string("original"))
     << "\",\"diffuse_depth\":" << depth("lava:diffuseDepth", 3, 32)
+    << ",\"upload_chunk_mib\":"
+    << delegate->GetRenderSetting(TfToken("lava:uploadChunkMiB"), 16)
     << ",\"reflection_depth\":" << depth("lava:reflectionDepth", 4, 32)
     << ",\"refraction_depth\":" << depth("lava:refractionDepth", 8, 32)
     << ",\"roulette_start\":" << depth("lava:rouletteStart", 3, 96)
@@ -1092,11 +1108,12 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     << ",\"orthographic\":"
     << (camera->GetProjection() == HdCamera::Orthographic ? "true" : "false")
     << "},\"meshes\":[";
-  uint64_t generation, geometryGeneration;
+  uint64_t generation, geometryGeneration, curvesGeneration;
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     generation = state.generation;
     geometryGeneration = state.geometryGeneration;
+    curvesGeneration = state.curvesGeneration;
   }
   auto cameraKey = o.str();
   auto mode = delegate->GetRenderSetting(TfToken("lava:mode"),
@@ -1113,6 +1130,9 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
   if (key != previous) {
     const bool viewOnly = revision && sceneGeneration == geometryGeneration &&
                           mode == "interactive" && sceneMode == mode;
+    const bool meshesOnly = !viewOnly && revision &&
+                            sceneCurvesGeneration == curvesGeneration &&
+                            mode == "interactive" && sceneMode == mode;
     {
       std::lock_guard<std::mutex> lock(state.mutex);
       bool first = true;
@@ -1138,7 +1158,7 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
         }
       o << "],\"curves\":[";
       first = true;
-      if (!viewOnly)
+      if (!viewOnly && !meshesOnly)
         for (auto const &p : state.curves) {
           if (!first)
             o << ',';
@@ -1175,17 +1195,21 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     o << "]}";
     auto json = o.str();
     if (std::getenv("LAVA_TRACE"))
-      std::fprintf(
-          stderr,
-          "Lava submit: generation=%llu, bytes=%zu, samples=%d, view=%d\n",
-          static_cast<unsigned long long>(generation), json.size(), samples,
-          viewOnly);
+      std::fprintf(stderr,
+                   "Lava submit: generation=%llu, bytes=%zu, samples=%d, "
+                   "view=%d, meshes=%d\n",
+                   static_cast<unsigned long long>(generation), json.size(),
+                   samples, viewOnly, meshesOnly);
     {
       std::lock_guard<std::mutex> l(session->mutex);
       revision =
           viewOnly
               ? lava_update_view(session->raw, json.c_str(), output->GetWidth(),
                                  output->GetHeight(), samples, exposure)
+          : meshesOnly
+              ? lava_update_meshes(session->raw, json.c_str(),
+                                   output->GetWidth(), output->GetHeight(),
+                                   samples, exposure)
               : lava_submit(session->raw, json.c_str(), output->GetWidth(),
                             output->GetHeight(), mode == "final", samples,
                             exposure);
@@ -1195,6 +1219,7 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
         TF_WARN("Lava: %s", lava_error(session->raw));
       else {
         sceneGeneration = geometryGeneration;
+        sceneCurvesGeneration = curvesGeneration;
         sceneMode = mode;
       }
     }

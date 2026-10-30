@@ -100,6 +100,27 @@ extern "C" int lava_houdini_smoke(const char *path, const char *cameraPath) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   } while (!imaging.isConverged() &&
            std::chrono::steady_clock::now() < deadline);
+  const int animationFrames = setting("LAVA_TEST_ANIMATION_FRAMES", 1);
+  for (int frame = 2; frame <= animationFrames; ++frame) {
+    imaging.setFrame(frame);
+    auto started = std::chrono::steady_clock::now();
+    deadline = started + std::chrono::seconds(120);
+    do {
+      if (!imaging.render(v, p, UT_DimRect(0, 0, width, height),
+                          "LavaRendererPlugin", &options, true))
+        return 5;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (!imaging.isConverged() &&
+             std::chrono::steady_clock::now() < deadline);
+    std::cerr << "HUSD animation frame=" << frame
+              << " converged=" << imaging.isConverged() << " elapsed_ms="
+              << std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - started)
+                     .count()
+              << "\n";
+    if (!imaging.isConverged())
+      return 7;
+  }
   std::cerr << "HUSD converged=" << imaging.isConverged()
             << " AOV mode=" << imaging.hasAOVBuffers() << " planes=";
   for (auto const &name : imaging.rendererPlanes())

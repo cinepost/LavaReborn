@@ -22,19 +22,20 @@ pub struct Camera {
 pub use crate::material::Material;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mesh {
+    #[serde(deserialize_with = "crate::mesh_transport::vectors")]
     pub points: Vec<[f32; 3]>,
     pub face_counts: Vec<u32>,
     pub indices: Vec<u32>,
     pub color: [f32; 3],
     #[serde(default)]
     pub material: Material,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::mesh_transport::vectors")]
     pub texcoords: Vec<[f32; 2]>,
     /// Optional face-corner indices into texcoords. Otherwise vertex interpolation.
     #[serde(default)]
     pub texcoord_indices: Vec<u32>,
     /// Optional world-space shading normals; empty indices mean vertex interpolation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::mesh_transport::vectors")]
     pub normals: Vec<[f32; 3]>,
     /// Face-corner indices, permitting hard edges and constant/uniform normals.
     #[serde(default)]
@@ -84,7 +85,7 @@ pub enum Light {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     #[serde(default)]
-    pub curves: Vec<crate::curves::Curves>,
+    pub curves: std::sync::Arc<Vec<crate::curves::Curves>>,
     #[serde(default)]
     pub settings: crate::integrator::IntegratorSettings,
     pub camera: Camera,
@@ -510,15 +511,24 @@ fn triangulate(points: &[[f32; 3]], face: &[u32]) -> Result<Vec<[u32; 3]>> {
 }
 
 impl Scene {
+    /// Compare image-affecting content independently of upload policy.
+    pub(crate) fn same_render_content(&self, other: &Self) -> bool {
+        self.settings.same_render_settings(other.settings)
+            && self.camera == other.camera
+            && self.lights == other.lights
+            && self.meshes == other.meshes
+            && self.curves == other.curves
+    }
     /// OpenPBR tables replace material parameters without affecting AS geometry.
     /// Crossing the legacy/model boundary rebuilds the packed legacy attributes.
     pub(crate) fn same_geometry(&self, other: &Self) -> bool {
-        self.curves.len() == other.curves.len()
-            && self
-                .curves
-                .iter()
-                .zip(&other.curves)
-                .all(|(a, b)| a.same_geometry(b))
+        (std::sync::Arc::ptr_eq(&self.curves, &other.curves)
+            || (self.curves.len() == other.curves.len()
+                && self
+                    .curves
+                    .iter()
+                    .zip(other.curves.iter())
+                    .all(|(a, b)| a.same_geometry(b))))
             && self.meshes.len() == other.meshes.len()
             && self.meshes.iter().zip(&other.meshes).all(|(a, b)| {
                 let surface_tables = a.material.openpbr.is_some() && b.material.openpbr.is_some();

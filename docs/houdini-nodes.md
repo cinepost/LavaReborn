@@ -16,6 +16,12 @@ settings-primitive header, camera/resolution controls, and grouped tabs:
   existing filtered image on the GPU without clearing history or restarting the
   sample counter, including after convergence.
 
+- Advanced: **Geometry Upload Chunk Size**, with 16, 32 and 64 MiB options
+  (default 16 MiB). Changes apply to subsequent geometry uploads and preserve
+  accumulation. Larger chunks favor scene activation time at some cost to frame
+  cadence during uploads. USD uses `lava:uploadChunkMiB`; JSON scenes use
+  `settings.upload_chunk_mib`.
+
 The node authors `/Render/Lava` by default. Select that prim in the Solaris
 viewport's Render Settings Prim selector if viewport overrides are active.
 Camera optics, focus distance and f-stop remain on the standard Camera LOP.
