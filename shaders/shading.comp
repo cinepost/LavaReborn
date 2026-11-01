@@ -14,7 +14,6 @@
 #include "materials/surface.glsl"
 layout(local_size_x=64) in;
 float powerWeight(float a,float b) {if(a<=0.)return 0.;float r=b/a;return 1./(1.+r*r);}
-vec3 environment() {return vec3(.015,.02,.03);}
 // Opt-in biased bound on reflected analytic-light multipliers, before light
 // intensity/exposure. Hue-preserving; diffuse, transmission and mesh emission
 // are deliberately excluded. The ordinary estimator is unchanged when off.
@@ -58,7 +57,7 @@ vec3 nextEvent(vec3 p,vec3 n,vec3 ng,vec3 albedo,float kd,inout uint seed) {
   vec3 target=l.position_kind.xyz;
   if(kind==2u)target+=(pathSample(seed)-.5)*l.u_soft.xyz+(pathSample(seed)-.5)*l.v.xyz;
   vec3 delta=target-p;float distance=length(delta);
-  vec3 wi=kind==3u?-normalize(l.direction_cone.xyz):delta/max(distance,1e-12);
+  vec3 wi=kind==3u?sampleDistant(l,seed):delta/max(distance,1e-12);
   if(dot(ng,wi)<=0.)return vec3(0);
   float cosine=max(0.,dot(n,wi));if(cosine==0.)return vec3(0);
   float pdf=selection,weight=1.;vec3 incident=emission(id);
@@ -68,6 +67,9 @@ vec3 nextEvent(vec3 p,vec3 n,vec3 ng,vec3 albedo,float kd,inout uint seed) {
     if(cosLight<=0.)return vec3(0);
     pdf*=distance*distance/(area*cosLight);
     weight=powerWeight(pdf,kd*cosine/PI);
+  } else if(kind==3u&&finiteDistant(l)) {
+    pdf/=distantSolidAngle(l);incident=distantRadiance(id);
+    weight=powerWeight(pdf,kd*cosine/PI);
   } else if(kind!=3u)incident/=max(distance*distance,1e-12);
   if(kind==1u) {
     float outer=cos(radians(l.direction_cone.w));
@@ -76,7 +78,7 @@ vec3 nextEvent(vec3 p,vec3 n,vec3 ng,vec3 albedo,float kd,inout uint seed) {
     incident*=inner>outer+1e-6?smoothstep(outer,inner,cone):step(outer,cone);
   }
   if(!lightVisible(p,ng,wi,target,kind,id))return vec3(0);
-  return kd*albedo/PI*incident*cosine*weight/max(pdf,1e-30);
+  return l.response.x*kd*albedo/PI*incident*cosine*weight/max(pdf,1e-30);
 }
 float fresnelDielectric(float c,float eta) {
   float sinT2=eta*eta*max(0.,1.-c*c);if(sinT2>=1.)return 1.;
@@ -143,8 +145,9 @@ vec3 surfaceNextEvent(vec3 p,vec3 n,MaterialSurface surface,vec3 throughput,inou
   vec3 target=l.position_kind.xyz;
   if(kind==2u)target+=(pathSample(seed)-.5)*l.u_soft.xyz+(pathSample(seed)-.5)*l.v.xyz;
   vec3 delta=target-p;float distance=length(delta);
-  vec3 wi=kind==3u?-normalize(l.direction_cone.xyz):delta/max(distance,1e-12);
+  vec3 wi=kind==3u?sampleDistant(l,seed):delta/max(distance,1e-12);
   OpenPBR_DiffuseSpecular lobes=materialLobes(surface,wi);
+  lobes.diffuse*=l.response.x;lobes.specular*=l.response.y;
   vec3 evaluation=lobes.diffuse+lobes.specular;if(materialEnergy(evaluation)<=0.)return vec3(0);
   float pdf=selection,weight=1.;vec3 incident=emission(id);
   if(kind==2u) {
@@ -152,6 +155,9 @@ vec3 surfaceNextEvent(vec3 p,vec3 n,MaterialSurface surface,vec3 throughput,inou
     float cosLight=emitterCosine(l,crossUV/max(area,1e-20),wi);
     if(cosLight<=0.)return vec3(0);
     pdf*=distance*distance/(area*cosLight);
+    weight=powerWeight(pdf,materialPdf(surface,wi));
+  } else if(kind==3u&&finiteDistant(l)) {
+    pdf/=distantSolidAngle(l);incident=distantRadiance(id);
     weight=powerWeight(pdf,materialPdf(surface,wi));
   } else if(kind!=3u)incident/=max(distance*distance,1e-12);
   if(kind==1u) {
@@ -193,7 +199,7 @@ bool scatter(inout PathRay ray,uint primitive,vec2 bary) {
    surface.geometricNormal=ng;
   }
  }
- radiance[ray.state.x].rgb+=ray.throughput.rgb*materialEmission(surface)+surfaceNextEvent(p,ng,surface,ray.throughput.rgb,ray.state.y);
+ radiance[ray.state.x].rgb+=ray.throughput.rgb*materialEmission(surface)*responseForCategory(materials[id].values[0].yz,ray.state.w)+surfaceNextEvent(p,ng,surface,ray.throughput.rgb,ray.state.y);
  vec3 wi,weight;float pdf;bool delta;uint category;
  if(!materialSample(surface,ray.state.y,wi,weight,pdf,delta,category))return false;
  depth[category]++;
@@ -214,11 +220,19 @@ void main() {
   uint index=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64u+gl_LocalInvocationIndex;
   PathRay ray;bool alive=false;
   if(pc.rayPhase==0u) {
+#ifdef LAVA_ADAPTIVE
+    if(index<activeCount) {
+      uint pixel=activePixels[index];
+#else
     if(index<pc.width*pc.height) {
-      uint pixel=index;Hit hit=hits[pixel];radiance[pixel]=vec4(0,0,0,1);
-      if(hit.primitive==0u)radiance[pixel].rgb=environment();
-      else if((hit.primitive&0x80000000u)!=0u)radiance[pixel].rgb=emission(hit.primitive&0x7fffffffu);
-      else {
+      uint pixel=index;
+#endif
+      Hit hit=hits[pixel];
+      // Visibility already resolves stochastic material cutouts. Uncovered
+      // camera samples are transparent black, never an implicit environment.
+      radiance[pixel]=vec4(0,0,0,hit.primitive==0u?0.:1.);
+      if((hit.primitive&0x80000000u)!=0u)radiance[pixel].rgb=emission(hit.primitive&0x7fffffffu);
+      else if(hit.primitive!=0u) {
         vec3 origin,direction;float plane;
         cameraRay(uvec2(pixel%pc.width,pixel/pc.width),origin,direction,plane);
         ray=PathRay(vec4(origin,0),vec4(direction,1),vec4(1),uvec4(pixel,4u,0,0));
@@ -243,10 +257,21 @@ void main() {
     if(traceLights(ray.originPdf.xyz,ray.directionDelta.xyz,1e-5,distance,emitter)) {
       vec3 target=ray.originPdf.xyz+distance*ray.directionDelta.xyz;
       float weight=ray.directionDelta.w>0.?1.:powerWeight(ray.originPdf.w,lightPdf(emitter,ray.originPdf.xyz,target,ray.directionDelta.xyz));
-      vec3 multiplier=ray.throughput.rgb*weight;
+      vec3 multiplier=ray.throughput.rgb*weight*lightResponse(emitter,ray.state.w);
       if(ray.state.w==2u)multiplier=reducedAnalyticReflection(multiplier);
       radiance[ray.state.x].rgb+=multiplier*emission(emitter);
-    } else if(!hit)radiance[ray.state.x].rgb+=ray.throughput.rgb*environment();
+    } else if(!hit) {
+      for(uint id=pc.lightCount>0u?lights[0].bvh.w:0xffffffffu;id!=0xffffffffu;id=lights[id].bvh.z) {
+        Light l=lights[id];if(!finiteDistant(l))continue;
+        vec3 difference=ray.directionDelta.xyz+normalize(l.direction_cone.xyz);
+        if(dot(difference,difference)>2.*l.response.z)continue;
+        float pdf=lightPmf(id,ray.originPdf.xyz)/distantSolidAngle(l);
+        float weight=ray.directionDelta.w>0.?1.:powerWeight(ray.originPdf.w,pdf);
+        vec3 multiplier=ray.throughput.rgb*weight*lightResponse(id,ray.state.w);
+        if(ray.state.w==2u)multiplier=reducedAnalyticReflection(multiplier);
+        radiance[ray.state.x].rgb+=multiplier*distantRadiance(id);
+      }
+    }
     else alive=scatter(ray,primitive,bary);
   }
   uvec4 activeMask=subgroupBallot(alive);uint activeCount=subgroupBallotBitCount(activeMask);

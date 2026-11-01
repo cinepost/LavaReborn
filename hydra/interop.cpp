@@ -39,7 +39,7 @@ bool extension(char const *name) {
       return true;
   return false;
 }
-GLuint program() {
+GLuint program(bool diagnostic = false) {
   const char *source = R"GLSL(#version 430
 layout(local_size_x=8,local_size_y=8) in;
 layout(std430,binding=0) readonly buffer Input {vec4 pixels[];};
@@ -50,6 +50,17 @@ void main(){uvec2 p=gl_GlobalInvocationID.xy;if(any(greaterThanEqual(p,dims)))re
  uint i=p.y*dims.x+p.x;ivec2 dst=ivec2(p.x,dims.y-1u-p.y);
  imageStore(colorOut,dst,pixels[i]);imageStore(depthOut,dst,pixels[dims.x*dims.y+i]);}
 )GLSL";
+  std::string diagnosticSource;
+  if (diagnostic) {
+    diagnosticSource = source;
+    auto pos = diagnosticSource.find("uniform uvec2 dims;");
+    diagnosticSource.insert(pos, "layout(rgba32f,binding=2) writeonly uniform "
+                                 "image2D sampleCountOut;\n");
+    pos = diagnosticSource.find("imageStore(colorOut");
+    diagnosticSource.insert(
+        pos, "imageStore(sampleCountOut,dst,pixels[2u*dims.x*dims.y+i]);");
+    source = diagnosticSource.c_str();
+  }
   GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
   glShaderSource(shader, 1, &source, nullptr);
   glCompileShader(shader);
@@ -95,12 +106,12 @@ struct GlState {
   struct Image {
     GLint name, level, layered, layer, access, format;
   };
-  std::array<Image, 2> images;
+  std::array<Image, 3> images;
   GlState() {
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &general);
     glGetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING, 0, &ssbo);
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 3; ++i) {
       auto &v = images[i];
       glGetIntegeri_v(GL_IMAGE_BINDING_NAME, i, &v.name);
       glGetIntegeri_v(GL_IMAGE_BINDING_LEVEL, i, &v.level);
@@ -114,7 +125,7 @@ struct GlState {
     glUseProgram(program);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, general);
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 3; ++i) {
       auto &v = images[i];
       glBindImageTexture(i, v.name, v.level, v.layered, v.layer, v.access,
                          v.format);
@@ -124,7 +135,8 @@ struct GlState {
 } // namespace
 struct LavaGlInterop::Impl {
   HgiGL hgi;
-  HgiTextureHandle color, depth;
+  HgiTextureHandle color, depth, sampleCount;
+  GLuint diagnosticShader = 0;
   GLuint shader = 0;
   uint64_t revision = 0;
   uint32_t sample = 0;
@@ -148,6 +160,10 @@ struct LavaGlInterop::Impl {
       hgi.DestroyTexture(&color);
     if (depth)
       hgi.DestroyTexture(&depth);
+    if (sampleCount)
+      hgi.DestroyTexture(&sampleCount);
+    if (diagnosticShader)
+      glDeleteProgram(diagnosticShader);
     if (shader)
       glDeleteProgram(shader);
   }
@@ -163,6 +179,8 @@ struct LavaGlInterop::Impl {
   }
   void resize(unsigned w, unsigned h) {
     if (width != w || height != h) {
+      if (sampleCount)
+        hgi.DestroyTexture(&sampleCount);
       if (color)
         hgi.DestroyTexture(&color);
       if (depth)
@@ -181,6 +199,19 @@ struct LavaGlInterop::Impl {
       float zero[4] = {0, 0, 0, 0}, far = 1e30f;
       glClearTexImage(color->GetRawResource(), 0, GL_RGBA, GL_FLOAT, zero);
       glClearTexImage(depth->GetRawResource(), 0, GL_RED, GL_FLOAT, &far);
+    }
+  }
+  void ensureSampleCountTexture() {
+    if (!sampleCount) {
+      HgiTextureDesc d;
+      d.debugName = "Lava sample count heat map";
+      d.dimensions = GfVec3i(width, height, 1);
+      d.format = HgiFormatFloat32Vec4;
+      d.usage = HgiTextureUsageBitsShaderRead | HgiTextureUsageBitsShaderWrite;
+      sampleCount = hgi.CreateTexture(d);
+      float zero[4] = {0, 0, 0, 1};
+      glClearTexImage(sampleCount->GetRawResource(), 0, GL_RGBA, GL_FLOAT,
+                      zero);
     }
   }
   void update(LavaSession *session, uint64_t r) {
@@ -236,6 +267,13 @@ struct LavaGlInterop::Impl {
       throw std::runtime_error("GL semaphore FD import failed");
     }
     resize(info.width, info.height);
+    bool diagnostic = (info.flags & 1u) != 0;
+    if (!diagnostic && sampleCount)
+      hgi.DestroyTexture(&sampleCount);
+    if (diagnostic)
+      ensureSampleCountTexture();
+    if (diagnostic && !diagnosticShader)
+      diagnosticShader = program(true);
     glGenSemaphoresEXT(1, &imported.returned);
     glImportSemaphoreFdEXT(imported.returned, GL_HANDLE_TYPE_OPAQUE_FD_EXT,
                            info.returned_fd);
@@ -243,13 +281,17 @@ struct LavaGlInterop::Impl {
                        nullptr);
     {
       GlState saved;
-      glUseProgram(shader);
-      glUniform2ui(glGetUniformLocation(shader, "dims"), width, height);
+      GLuint selected = diagnostic ? diagnosticShader : shader;
+      glUseProgram(selected);
+      glUniform2ui(glGetUniformLocation(selected, "dims"), width, height);
       glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, imported.buffer);
       glBindImageTexture(0, color->GetRawResource(), 0, GL_FALSE, 0,
                          GL_WRITE_ONLY, GL_RGBA32F);
       glBindImageTexture(1, depth->GetRawResource(), 0, GL_FALSE, 0,
                          GL_WRITE_ONLY, GL_R32F);
+      if (diagnostic)
+        glBindImageTexture(2, sampleCount->GetRawResource(), 0, GL_FALSE, 0,
+                           GL_WRITE_ONLY, GL_RGBA32F);
       glDispatchCompute((width + 7) / 8, (height + 7) / 8, 1);
       glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                       GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -284,19 +326,22 @@ LavaGlInterop::LavaGlInterop() {
 }
 LavaGlInterop::~LavaGlInterop() = default;
 HgiTextureHandle LavaGlInterop::Get(LavaSession *session, uint64_t revision,
-                                    bool depth, unsigned width,
+                                    unsigned plane, unsigned width,
                                     unsigned height) {
   impl->hgi.StartFrame();
   try {
     impl->resize(width, height);
     if (session)
       impl->update(session, revision);
+    if (plane == 2)
+      impl->ensureSampleCountTexture();
   } catch (...) {
     impl->hgi.EndFrame();
     throw;
   }
   impl->hgi.EndFrame();
-  return depth ? impl->depth : impl->color;
+  return plane == 2 ? impl->sampleCount
+                    : (plane == 1 ? impl->depth : impl->color);
 }
 void LavaGlInterop::Retire(LavaGlInterop *p) {
   if (!p)

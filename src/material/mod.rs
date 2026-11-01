@@ -131,10 +131,20 @@ pub(crate) fn upload(
     let records: Vec<_> = scene
         .meshes
         .iter()
-        .map(|m| (&m.material, m.color))
-        .chain(scene.curves.iter().map(|c| (&c.material, c.color)))
-        .map(|(material, color)| {
-            if material.openpbr.is_none() && !material.textures.is_empty() {
+        .map(|m| {
+            (
+                &m.material,
+                m.color,
+                if m.geometry_light {
+                    m.light_response
+                } else {
+                    [1.; 2]
+                },
+            )
+        })
+        .chain(scene.curves.iter().map(|c| (&c.material, c.color, [1.; 2])))
+        .map(|(material, color, response)| {
+            let mut record = if material.openpbr.is_none() && !material.textures.is_empty() {
                 OpenPbrSurface {
                     base_color: color,
                     base_metalness: material.metallic,
@@ -145,7 +155,10 @@ pub(crate) fn upload(
                 .gpu()
             } else {
                 material.gpu()
-            }
+            };
+            record.values[0][1] = response[0];
+            record.values[0][2] = response[1];
+            record
         })
         .collect();
     let bytes = bytemuck::cast_slice(&records);

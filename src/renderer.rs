@@ -1,3 +1,14 @@
+#[path = "renderer_adaptive.rs"]
+mod adaptive;
+#[cfg(test)]
+#[path = "renderer_alpha_tests.rs"]
+mod alpha_tests;
+#[cfg(test)]
+#[path = "renderer_filter_tests.rs"]
+mod filter_tests;
+#[cfg(test)]
+#[path = "renderer_sample_count_tests.rs"]
+mod sample_count_tests;
 use crate::{
     graph::Graph,
     policy::Mode,
@@ -39,6 +50,8 @@ struct Push {
     reduce_analytic_caustics: u32,
     mesh_triangles: u32,
     curve_count: u32,
+    adaptive_threshold: f32,
+    adaptive_min_samples: u32,
 }
 /// Immutable object acceleration survives replacement of unrelated scene geometry.
 /// Weak cache ownership avoids retaining VRAM or creating a Device ownership cycle.
@@ -125,7 +138,10 @@ impl GpuPass {
                 &[],
                 &[],
             );
-            for buffer in std::iter::once(&self.output).chain(self.filtered.iter()) {
+            for buffer in std::iter::once(&self.output)
+                .chain(self.filtered.iter())
+                .chain(self.scratch.iter())
+            {
                 buffer
                     .device
                     .raw
@@ -148,7 +164,25 @@ impl GpuPass {
         Ok(())
     }
 }
+struct AdaptiveResources {
+    device: Arc<Device>,
+    pipelines: Vec<vk::Pipeline>,
+    pixels: Buffer,
+    control: Buffer,
+    readback: Buffer,
+}
+impl Drop for AdaptiveResources {
+    fn drop(&mut self) {
+        unsafe {
+            for &p in &self.pipelines {
+                self.device.raw.destroy_pipeline(p, None);
+            }
+        }
+    }
+}
 pub struct Renderer {
+    adaptive: Option<AdaptiveResources>,
+    sample_count_pipelines: [Option<vk::Pipeline>; 2],
     reorder_rays: bool,
     warned_curve_fallback: bool,
     curve_blas: Vec<Arc<CurveBlas>>,
@@ -158,6 +192,8 @@ pub struct Renderer {
     textures: crate::texture::gpu::MaterialTextures,
     #[cfg(test)]
     coherent_camera_reference: bool,
+    #[cfg(test)]
+    progressive_sampling_reference: bool,
     device: Arc<Device>,
     pub width: u32,
     pub height: u32,
@@ -166,6 +202,7 @@ pub struct Renderer {
     pub gpu_output: bool,
     pub gpu_frame: Option<Arc<crate::interop::GpuFrame>>,
     pub depth: Vec<f32>,
+    pub sample_count_image: Vec<f32>,
     passes: Vec<GpuPass>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -215,6 +252,8 @@ impl Renderer {
         let material_luts = crate::material::upload_luts(device.clone())?;
         let sample_primes = crate::sampling::upload(device.clone())?;
         let mut r = Self {
+            adaptive: None,
+            sample_count_pipelines: [None; 2],
             reorder_rays: reorder,
             warned_curve_fallback: false,
             curve_blas: Vec::new(),
@@ -233,6 +272,7 @@ impl Renderer {
             gpu_output: false,
             gpu_frame: None,
             depth: Vec::new(),
+            sample_count_image: Vec::new(),
             passes: Vec::new(),
             set_layout: vk::DescriptorSetLayout::null(),
             layout: vk::PipelineLayout::null(),
@@ -243,6 +283,8 @@ impl Renderer {
             blas: None,
             #[cfg(test)]
             coherent_camera_reference: false,
+            #[cfg(test)]
+            progressive_sampling_reference: false,
             textures: crate::texture::gpu::MaterialTextures::new(device.clone())?,
             light_count: 0,
             light_bvh: None,
@@ -281,7 +323,7 @@ impl Renderer {
                 .get_physical_device_properties(r.device.physical)
                 .limits
                 .max_compute_work_group_count[0];
-            let bindings: Vec<_> = (0..23)
+            let bindings: Vec<_> = (0..26)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
@@ -335,7 +377,7 @@ impl Renderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 18,
+                    descriptor_count: 21,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -496,6 +538,14 @@ impl Renderer {
                 false,
             )?,
         ];
+        let adaptive_buffers = if self.adaptive.is_some() {
+            Some((
+                Buffer::new(self.device.clone(), pixels * 16, usage, false)?,
+                Buffer::new(self.device.clone(), pixels * 4, usage, false)?,
+            ))
+        } else {
+            None
+        };
         if let Some(raster) = self.passes[0].raster.as_mut() {
             raster.resize(width, height, self.set)?;
         }
@@ -505,6 +555,10 @@ impl Renderer {
         self.passes[2].filtered = Some(filtered);
         for (i, queue) in queues.into_iter().enumerate() {
             self.passes[1].scratch[i] = queue;
+        }
+        if let Some((stats, pixels)) = adaptive_buffers {
+            self.passes[2].scratch[0] = stats;
+            self.adaptive.as_mut().unwrap().pixels = pixels;
         }
         self.width = width;
         self.height = height;
@@ -517,6 +571,19 @@ impl Renderer {
                 (8, self.passes[2].filtered.as_ref().unwrap()),
                 (10, &self.passes[1].scratch[0]),
                 (11, &self.passes[1].scratch[1]),
+                (
+                    23,
+                    self.passes[2]
+                        .scratch
+                        .first()
+                        .unwrap_or(&self.passes[1].scratch[2]),
+                ),
+                (
+                    24,
+                    self.adaptive
+                        .as_ref()
+                        .map_or(&self.passes[1].scratch[2], |a| &a.pixels),
+                ),
             ] {
                 let info = [vk::DescriptorBufferInfo::default()
                     .buffer(buffer.raw)
@@ -891,6 +958,9 @@ impl Renderer {
                 scene,
             )?);
         }
+        if scene.settings.adaptive_sampling {
+            self.ensure_adaptive()?;
+        }
         self.settings = scene.settings;
         self.textures.set_mode(scene.settings.textures)?;
         let c = &scene.camera;
@@ -961,6 +1031,25 @@ impl Renderer {
                 // Disabled specialization in production; profiler replaces this binding.
                 (21, &self.passes[1].scratch[2]),
                 (22, &self.passes[1].scratch[2]),
+                (
+                    23,
+                    self.passes[2]
+                        .scratch
+                        .first()
+                        .unwrap_or(&self.passes[1].scratch[2]),
+                ),
+                (
+                    24,
+                    self.adaptive
+                        .as_ref()
+                        .map_or(&self.passes[1].scratch[2], |a| &a.pixels),
+                ),
+                (
+                    25,
+                    self.adaptive
+                        .as_ref()
+                        .map_or(&self.passes[1].scratch[2], |a| &a.control),
+                ),
             ] {
                 let infos = [vk::DescriptorBufferInfo::default()
                     .buffer(buffer.raw)
@@ -998,11 +1087,63 @@ impl Renderer {
         self.sampling_target = 0;
         self.gpu_frame = None;
         self.depth.clear();
+        self.sample_count_image.clear();
+        Ok(())
+    }
+    /// AOV requests change display products without invalidating radiance history.
+    pub(crate) fn set_sample_count_aov(&mut self, enabled: bool) {
+        self.settings.sample_count_aov = enabled;
+        if !enabled {
+            self.sample_count_image.clear();
+        }
+    }
+    fn ensure_sample_count_pipeline(&mut self) -> Result<()> {
+        if self.settings.sample_count_aov {
+            let index = usize::from(self.settings.adaptive_sampling);
+            if self.sample_count_pipelines[index].is_none() {
+                let product: &[u8] = if index == 1 {
+                    include_bytes!(concat!(env!("OUT_DIR"), "/sample_count_adaptive.spv"))
+                } else {
+                    include_bytes!(concat!(env!("OUT_DIR"), "/sample_count.spv"))
+                };
+                let code = ash::util::read_spv(&mut std::io::Cursor::new(product))?;
+                unsafe {
+                    let module = self.device.raw.create_shader_module(
+                        &vk::ShaderModuleCreateInfo::default().code(&code),
+                        None,
+                    )?;
+                    let result = self.device.raw.create_compute_pipelines(
+                        self.pipeline_cache.raw,
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .layout(self.layout)
+                            .stage(
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .stage(vk::ShaderStageFlags::COMPUTE)
+                                    .module(module)
+                                    .name(c"main"),
+                            )],
+                        None,
+                    );
+                    self.device.raw.destroy_shader_module(module, None);
+                    match result {
+                        Ok(p) => self.sample_count_pipelines[index] = Some(p[0]),
+                        Err((partial, e)) => {
+                            for p in partial {
+                                self.device.raw.destroy_pipeline(p, None);
+                            }
+                            return Err(e.into());
+                        }
+                    }
+                }
+                self.pipeline_cache.persist();
+            }
+        }
         Ok(())
     }
     /// Returns one completed batch. Zero remaining reprocesses an existing image only.
     /// Interactive workers check their mailbox after each call.
     pub fn render_batch(&mut self, remaining: u32, exposure: f32) -> Result<Vec<f32>> {
+        self.ensure_sample_count_pipeline()?;
         let target_before = self
             .samples()
             .checked_add(remaining)
@@ -1048,13 +1189,22 @@ impl Renderer {
             println!("Lava [WARNING]: Vulkan external memory/semaphores unavailable; CPU image fallback requires transfer through system RAM.");
             self.gpu_output = false;
         }
-        let output_needed = self.mode == Mode::Interactive || count == remaining;
+        let adaptive = self.settings.adaptive_sampling;
+        let sampling_mode = u32::from(self.mode == Mode::Final && !adaptive);
+        #[cfg(test)]
+        let sampling_mode = if self.progressive_sampling_reference {
+            0
+        } else {
+            sampling_mode
+        };
+        let output_needed = adaptive || self.mode == Mode::Interactive || count == remaining;
         let gpu = if self.gpu_output && self.device.interop && output_needed {
-            match crate::interop::GpuFrame::new(
+            match crate::interop::GpuFrame::with_sample_count(
                 self.device.clone(),
                 self.width,
                 self.height,
                 self.samples() + count,
+                self.settings.sample_count_aov,
             ) {
                 Ok(frame) => Some(Arc::new(frame)),
                 Err(e) => {
@@ -1068,8 +1218,14 @@ impl Renderer {
         };
         // The GPU presentation path does not need a full-sized host-visible
         // output. Allocate it only when CPU output is actually requested.
-        let output_size = self.width as u64 * self.height as u64 * 32;
-        if gpu.is_none() && output_needed && self.passes[3].output.size < output_size {
+        let output_size = self.width as u64
+            * self.height as u64
+            * if self.settings.sample_count_aov {
+                48
+            } else {
+                32
+            };
+        if gpu.is_none() && output_needed && self.passes[3].output.size != output_size {
             self.passes[3].output = Buffer::new(
                 self.device.clone(),
                 output_size,
@@ -1110,7 +1266,11 @@ impl Renderer {
                     let mut push = Push {
                         width: self.width,
                         height: self.height,
-                        sample,
+                        sample: if count == 0 {
+                            sample.saturating_sub(1)
+                        } else {
+                            sample
+                        },
                         lights: self.light_count,
                         exposure,
                         radius: self.mode.policy().filter_radius,
@@ -1126,8 +1286,10 @@ impl Renderer {
                         ray_phase: 0,
                         queue_parity: 0,
                         max_groups_x: self.max_groups_x,
-                        sampling_mode: u32::from(self.mode == Mode::Final),
+                        sampling_mode,
                         target_samples: self.sampling_target,
+                        adaptive_threshold: self.settings.adaptive_threshold,
+                        adaptive_min_samples: self.settings.adaptive_min_samples,
                     };
                     device.raw.cmd_push_constants(
                         cmd,
@@ -1136,6 +1298,9 @@ impl Renderer {
                         0,
                         bytemuck::bytes_of(&push),
                     );
+                    if adaptive && count > 0 {
+                        self.record_adaptive_prepare(cmd, &push);
+                    }
                     for &pass in &self.plan.order {
                         // Re-present existing filtered floating-point history without tracing
                         // or changing accumulation/sample counters.
@@ -1146,7 +1311,7 @@ impl Renderer {
                         if pass == 3
                             && count > 0
                             && (sample + 1 != self.samples() + count
-                                || (self.mode == Mode::Final && count != remaining))
+                                || (!adaptive && self.mode == Mode::Final && count != remaining))
                         {
                             continue;
                         }
@@ -1164,9 +1329,21 @@ impl Renderer {
                             cmd,
                             vk::PipelineBindPoint::COMPUTE,
                             if raster_visibility {
-                                self.passes[0].raster.as_ref().unwrap().resolve
+                                if adaptive {
+                                    self.adaptive.as_ref().unwrap().pipelines[3]
+                                } else {
+                                    self.passes[0].raster.as_ref().unwrap().resolve
+                                }
                             } else {
-                                self.passes[pass].pipeline
+                                if adaptive && pass < 3 {
+                                    self.adaptive.as_ref().unwrap().pipelines[pass]
+                                } else {
+                                    if pass == 3 && self.settings.sample_count_aov {
+                                        self.sample_count_pipelines[usize::from(adaptive)].unwrap()
+                                    } else {
+                                        self.passes[pass].pipeline
+                                    }
+                                }
                             },
                         );
                         if pass == 1 {
@@ -1204,7 +1381,15 @@ impl Renderer {
                             );
                             let groups = (self.width * self.height).div_ceil(64);
                             let x = groups.min(self.max_groups_x);
-                            device.raw.cmd_dispatch(cmd, x, groups.div_ceil(x), 1);
+                            if adaptive {
+                                device.raw.cmd_dispatch_indirect(
+                                    cmd,
+                                    self.adaptive.as_ref().unwrap().control.raw,
+                                    16,
+                                );
+                            } else {
+                                device.raw.cmd_dispatch(cmd, x, groups.div_ceil(x), 1);
+                            }
                             let wave = [vk::MemoryBarrier::default()
                                 .src_access_mask(
                                     vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
@@ -1272,10 +1457,20 @@ impl Renderer {
                                 device.raw.cmd_bind_pipeline(
                                     cmd,
                                     vk::PipelineBindPoint::COMPUTE,
-                                    self.passes[1].pipeline,
+                                    if adaptive {
+                                        self.adaptive.as_ref().unwrap().pipelines[1]
+                                    } else {
+                                        self.passes[1].pipeline
+                                    },
                                 );
                                 device.raw.cmd_dispatch_indirect(cmd, control.raw, 16);
                             }
+                        } else if adaptive && (pass == 2 || (pass == 0 && !raster_visibility)) {
+                            device.raw.cmd_dispatch_indirect(
+                                cmd,
+                                self.adaptive.as_ref().unwrap().control.raw,
+                                16,
+                            );
                         } else {
                             device.raw.cmd_dispatch(
                                 cmd,
@@ -1302,7 +1497,7 @@ impl Renderer {
                         );
                         if pass == 2
                             && sample + 1 == self.samples() + count
-                            && (self.mode == Mode::Interactive || count == remaining)
+                            && (adaptive || self.mode == Mode::Interactive || count == remaining)
                         {
                             // Filtering is the second phase of accumulation; never overwrite history.
                             push.filter_phase = 1;
@@ -1343,6 +1538,39 @@ impl Renderer {
                     &[],
                     &[],
                 );
+                if adaptive && count > 0 {
+                    let a = self.adaptive.as_ref().unwrap();
+                    let barrier = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                    device.raw.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &barrier,
+                        &[],
+                        &[],
+                    );
+                    device.raw.cmd_copy_buffer(
+                        cmd,
+                        a.control.raw,
+                        a.readback.raw,
+                        &[vk::BufferCopy::default().size(4)],
+                    );
+                    let barrier = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    device.raw.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &barrier,
+                        &[],
+                        &[],
+                    );
+                }
                 if let Some(g) = &gpu {
                     let release = [vk::BufferMemoryBarrier::default()
                         .buffer(g.buffer.raw)
@@ -1366,7 +1594,13 @@ impl Renderer {
         )?;
         self.gpu_frame = gpu;
         self.passes[2].samples += count;
-        if self.mode == Mode::Final && count != remaining {
+        let complete = adaptive
+            && count > 0
+            && self.adaptive.as_ref().unwrap().readback.read_floats(1)?[0].to_bits() == 0;
+        if complete {
+            self.passes[2].samples = self.sampling_target;
+        }
+        if self.mode == Mode::Final && count != remaining && !complete {
             return Ok(Vec::new());
         }
         if self.gpu_frame.is_some() {
@@ -1375,8 +1609,19 @@ impl Renderer {
         }
         let n = self.width as usize * self.height as usize;
         crate::interop::IMAGE_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut packed = self.passes[3].output.read_floats(n * 8)?;
-        self.depth = packed[n * 4..].iter().step_by(4).copied().collect();
+        let mut packed = self.passes[3].output.read_floats(
+            n * if self.settings.sample_count_aov {
+                12
+            } else {
+                8
+            },
+        )?;
+        self.sample_count_image = if self.settings.sample_count_aov {
+            packed[n * 8..].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.depth = packed[n * 4..n * 8].iter().step_by(4).copied().collect();
         packed.truncate(n * 4);
         Ok(packed)
     }
@@ -1387,6 +1632,9 @@ impl Drop for Renderer {
             pass.raster.take();
         }
         unsafe {
+            for p in self.sample_count_pipelines.iter().flatten() {
+                self.device.raw.destroy_pipeline(*p, None);
+            }
             for p in &self.passes {
                 self.device.raw.destroy_pipeline(p.pipeline, None);
                 if let Some(prepare) = p.prepare_pipeline {
@@ -1414,7 +1662,7 @@ mod path_tests {
         integrator::IntegratorSettings,
         scene::{Camera, Light, Material, Mesh},
     };
-    fn fixture() -> Scene {
+    pub(super) fn fixture() -> Scene {
         Scene {
             curves: Default::default(),
             settings: IntegratorSettings {
@@ -1426,6 +1674,7 @@ mod path_tests {
                 refraction_depth: 0,
                 roulette_start: 96,
                 reduce_analytic_caustics: false,
+                ..Default::default()
             },
             camera: Camera {
                 transform: glam::Mat4::from_translation(glam::Vec3::new(0., 0., 0.5))
@@ -1445,6 +1694,7 @@ mod path_tests {
                 normal_indices: Vec::new(),
                 reverse_orientation: false,
                 geometry_light: false,
+                light_response: [1.; 2],
                 render_light_geometry: false,
                 texcoords: Vec::new(),
                 texcoord_indices: Vec::new(),
@@ -1460,6 +1710,8 @@ mod path_tests {
                 material: Material::default(),
             }],
             lights: vec![Light::Area {
+                diffuse: 1.,
+                specular: 1.,
                 single_sided: true,
                 render_light_geometry: true,
                 position: [0., 0., 1.],
@@ -1470,7 +1722,7 @@ mod path_tests {
             }],
         }
     }
-    fn mean(renderer: &mut Renderer, scene: &Scene, samples: u32) -> f32 {
+    pub(super) fn mean(renderer: &mut Renderer, scene: &Scene, samples: u32) -> f32 {
         renderer.set_scene(scene).unwrap();
         let mut image = Vec::new();
         while renderer.samples() < samples {
@@ -1620,7 +1872,7 @@ mod path_tests {
                 let left = pixels[(16 * 32 + 6) * 4];
                 let right = pixels[(16 * 32 + 26) * 4];
                 assert!(
-                    (left - 0.015).abs() < 1e-5 && (right - 1.).abs() < 1e-5,
+                    left.abs() < 1e-5 && (right - 1.).abs() < 1e-5,
                     "textured cutout {left}/{right} {visibility:?} {mode:?}"
                 );
             }
@@ -1792,14 +2044,7 @@ mod path_tests {
                 let pixels = renderer.render_batch(4, 0.).unwrap();
                 for (x, expected) in [
                     (8, 1.),
-                    (
-                        24,
-                        if mode == TextureMode::Virtual {
-                            1.
-                        } else {
-                            0.015
-                        },
-                    ),
+                    (24, if mode == TextureMode::Virtual { 1. } else { 0. }),
                     (40, 1.),
                 ] {
                     assert!(
@@ -1994,6 +2239,8 @@ mod path_tests {
                 scene.settings.refraction_depth = 1;
                 scene.meshes[0].texcoords = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
                 scene.lights = vec![Light::Area {
+                    diffuse: 1.,
+                    specular: 1.,
                     position: [0., 0., -1.],
                     u: [4., 0., 0.],
                     v: [0., 4., 0.],
@@ -2127,6 +2374,9 @@ mod path_tests {
                     ..Default::default()
                 });
                 scene.lights = vec![Light::Directional {
+                    diffuse: 1.,
+                    specular: 1.,
+                    angle: 0.,
                     direction: [0., 0., -1.],
                     color: [1.; 3],
                     intensity: std::f32::consts::PI,
@@ -2206,6 +2456,9 @@ mod path_tests {
                 ..Default::default()
             });
             scene.lights = vec![Light::Directional {
+                diffuse: 1.,
+                specular: 1.,
+                angle: 0.,
                 direction: [0., 0., -1.],
                 color: [1.; 3],
                 intensity: std::f32::consts::PI,
@@ -2241,6 +2494,9 @@ mod path_tests {
             scene.meshes[0].material.textures.clear();
             camera(&mut scene, 180.);
             scene.lights = vec![Light::Directional {
+                diffuse: 1.,
+                specular: 1.,
+                angle: 0.,
                 direction: [0., 0., 1.],
                 color: [1.; 3],
                 intensity: std::f32::consts::PI,
@@ -2277,6 +2533,9 @@ mod path_tests {
                 scene.settings.reflection_depth = 0;
                 scene.settings.refraction_depth = 0;
                 scene.lights = vec![Light::Directional {
+                    diffuse: 1.,
+                    specular: 1.,
+                    angle: 0.,
                     direction: [0., 0., -1.],
                     color: [1.; 3],
                     intensity: std::f32::consts::PI,
@@ -2304,6 +2563,9 @@ mod path_tests {
                 // Light below actual geometry must not leak through a tilted shading frame.
                 scene.meshes[0].normals = vec![[0.8, 0., 0.6]; 4];
                 scene.lights = vec![Light::Directional {
+                    diffuse: 1.,
+                    specular: 1.,
+                    angle: 0.,
                     direction: [-0.9, 0., 0.1],
                     color: [1.; 3],
                     intensity: 100.,
@@ -2313,6 +2575,9 @@ mod path_tests {
                 scene.meshes[0].normal_indices = vec![0; 4];
                 scene.meshes[0].normals = vec![[0.6, 0., 0.8]];
                 scene.lights = vec![Light::Directional {
+                    diffuse: 1.,
+                    specular: 1.,
+                    angle: 0.,
                     direction: [0., 0., -1.],
                     color: [1.; 3],
                     intensity: std::f32::consts::PI,
@@ -2343,7 +2608,7 @@ mod path_tests {
             }
             let lit = mean(&mut renderer, &scene, 128);
             assert!(
-                (dark - 0.012).abs() < 1e-5 && lit > 0.1,
+                dark.abs() < 1e-5 && lit > 0.1,
                 "reverse emission {dark} vs {lit}"
             );
             if let Light::Area {
@@ -2394,9 +2659,7 @@ mod path_tests {
             let hidden = mean(&mut renderer, &scene, 4);
             scene.meshes[0].render_light_geometry = true;
             let shown = mean(&mut renderer, &scene, 4);
-            assert!(
-                ordinary > 1.9 && (hidden - 0.015).abs() < 1e-5 && (ordinary - shown).abs() < 1e-6
-            );
+            assert!(ordinary > 1.9 && hidden.abs() < 1e-5 && (ordinary - shown).abs() < 1e-6);
         }
     }
     #[test]
@@ -2416,7 +2679,7 @@ mod path_tests {
                     4. / ((n * n) as f64 * std::f64::consts::PI * (1. + u * u + v * v).powi(2));
             }
         }
-        let expected = 0.8 * (3. * probability + 0.015 * (1. - probability)) as f32;
+        let expected = 0.8 * (3. * probability) as f32;
         let mis = mean(&mut renderer, &scene, 512);
         assert!(
             (mis - expected).abs() < expected * 0.02,
@@ -2483,6 +2746,8 @@ mod path_tests {
         );
         scene.settings.roulette_start = 96;
         scene.lights.push(Light::Point {
+            diffuse: 1.,
+            specular: 1.,
             position: [0., 0., 1.],
             color: [1.; 3],
             intensity: 2.,
@@ -2513,6 +2778,8 @@ mod path_tests {
             ior: 1.5,
         };
         scene.lights = vec![Light::Area {
+            diffuse: 1.,
+            specular: 1.,
             single_sided: true,
             render_light_geometry: true,
             position: [0., 0., -1.],
@@ -3010,6 +3277,8 @@ mod path_tests {
             let mut scene = fixture();
             scene.settings.visibility = visibility;
             scene.lights = vec![Light::Point {
+                diffuse: 1.,
+                specular: 1.,
                 position: [0., 0., 2.],
                 color: [1.; 3],
                 intensity: 4. * std::f32::consts::PI,
@@ -3090,16 +3359,23 @@ mod path_tests {
         });
         for light in [
             Light::Directional {
+                diffuse: 1.,
+                specular: 1.,
+                angle: 0.,
                 direction: [0., 0., -1.],
                 color: [1.; 3],
                 intensity: 1.,
             },
             Light::Point {
+                diffuse: 1.,
+                specular: 1.,
                 position: [0., 0., 1.],
                 color: [1.; 3],
                 intensity: 1.,
             },
             Light::Spot {
+                diffuse: 1.,
+                specular: 1.,
                 position: [0., 0., 1.],
                 direction: [0., 0., -1.],
                 color: [1.; 3],
@@ -3225,6 +3501,8 @@ mod path_tests {
         };
         scene.meshes[0].material.openpbr = Some(p);
         scene.lights = vec![Light::Area {
+            diffuse: 1.,
+            specular: 1.,
             single_sided: true,
             render_light_geometry: true,
             position: [0., 0., -1.],
@@ -3284,6 +3562,9 @@ mod path_tests {
                     });
                 }
                 scene.lights = vec![Light::Directional {
+                    diffuse: 1.,
+                    specular: 1.,
+                    angle: 0.,
                     direction: [-1., 0., 0.15],
                     color: [1.; 3],
                     intensity: 2. * std::f32::consts::PI,
@@ -3363,7 +3644,7 @@ mod path_tests {
                     4. / ((n * n) as f64 * std::f64::consts::PI * (1. + u * u + v * v).powi(2));
             }
         }
-        let expected = 0.8 * (100. * probability + 0.015 * (1. - probability)) as f32;
+        let expected = 0.8 * (100. * probability) as f32;
         for native in [false, true] {
             if native {
                 scene.meshes[0].material.openpbr = Some(crate::material::OpenPbrSurface {
@@ -3385,6 +3666,8 @@ mod path_tests {
                     *p = (glam::Vec3::from_array(base) + translation).to_array();
                 }
                 scene.lights = vec![Light::Area {
+                    diffuse: 1.,
+                    specular: 1.,
                     single_sided: true,
                     render_light_geometry: true,
                     position: (translation + glam::Vec3::new(4., 0., 1.)).to_array(),
@@ -3413,6 +3696,8 @@ mod path_tests {
                 });
             }
             scene.lights = vec![Light::Area {
+                diffuse: 1.,
+                specular: 1.,
                 single_sided: true,
                 render_light_geometry: true,
                 position: [4., 0., 1.],
@@ -3426,6 +3711,8 @@ mod path_tests {
             // This separate dark emitter covers every direct sample of the first
             // rectangle, but lies outside the primary camera ray.
             scene.lights.push(Light::Area {
+                diffuse: 1.,
+                specular: 1.,
                 single_sided: true,
                 render_light_geometry: true,
                 position: [2., 0., 0.5],
@@ -3445,6 +3732,7 @@ mod path_tests {
                 normal_indices: Vec::new(),
                 reverse_orientation: false,
                 geometry_light: false,
+                light_response: [1.; 2],
                 render_light_geometry: false,
                 points: vec![[1., -1., 0.5], [3., -1., 0.5], [3., 1., 0.5], [1., 1., 0.5]],
                 face_counts: vec![4],
@@ -3467,7 +3755,7 @@ mod path_tests {
             .0
             .to_vec()
     }
-    fn buffer_snapshot(renderer: &Renderer, source: &Buffer) -> Vec<f32> {
+    pub(super) fn buffer_snapshot(renderer: &Renderer, source: &Buffer) -> Vec<f32> {
         let staging = Buffer::new(
             renderer.device.clone(),
             source.size,
@@ -3645,6 +3933,8 @@ mod path_tests {
                         foreground.texcoords = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
                         scene.meshes.push(foreground);
                         scene.lights = vec![Light::Area {
+                            diffuse: 1.,
+                            specular: 1.,
                             single_sided: true,
                             render_light_geometry: true,
                             position: [1.2, 0.2, 3.],
@@ -3741,3 +4031,7 @@ mod profiling;
 #[cfg(test)]
 #[path = "renderer_upload_bench.rs"]
 mod upload_benchmark;
+
+#[cfg(test)]
+#[path = "renderer_light_tests.rs"]
+mod light_tests;

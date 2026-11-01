@@ -12,16 +12,30 @@ void main() {
   if (any(greaterThanEqual(p, ivec2(pc.width, pc.height))))
     return;
   uint i = uint(p.y) * pc.width + uint(p.x);
+#ifdef LAVA_SAMPLE_COUNT
+#ifdef LAVA_ADAPTIVE
+  uint sampleCount = pixelStats[i].count;
+#else
+  uint sampleCount = pc.targetSamples == 0u ? 0u : pc.sampleIndex + 1u;
+#endif
+  // Fixed scale relative to the requested sample budget, never the frame maximum.
+  float t = clamp(float(sampleCount) / float(max(pc.targetSamples, 1u)), 0., 1.);
+  vec3 heat = clamp(vec3(1.5) - abs(4. * t - vec3(3., 2., 1.)), 0., 1.);
+  display[2u * pc.width * pc.height + i] = vec4(sampleCount == 0u ? vec3(0) : heat, 1);
+#endif
+  float alpha=clamp(filtered[i].a,0.,1.);
   vec3 color = max(vec3(0), filtered[i].rgb * exp2(pc.exposure));
   float depth =
       hits[i].primitive == 0u ? camera.clippingOffset.y : hits[i].distance;
   display[pc.width * pc.height + i] = vec4(depth, 0, 0, 0);
   if (pc.linearOutput != 0u) {
-    display[i] = vec4(color, 1);
+    display[i] = vec4(color, alpha);
     return;
   }
+  // Apply nonlinear display transforms to unassociated color, then premultiply.
+  color = alpha>0.?color/alpha:vec3(0);
   color = clamp((color * (2.51 * color + .03)) /
                     (color * (2.43 * color + .59) + .14),
                 0., 1.);
-  display[i] = vec4(srgb(color), 1);
+  display[i] = vec4(srgb(color)*alpha, alpha);
 }

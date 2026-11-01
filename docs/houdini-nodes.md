@@ -9,10 +9,14 @@ Connect Lava Render Settings after your scene. Its layout follows Karma's
 settings-primitive header, camera/resolution controls, and grouped tabs:
 
 - Sampling: interactive/final mode, ray-query/raster visibility, samples, headlight.
+- Adaptive Sampling, Relative Error Threshold and Minimum Samples are in the
+  Sampling tab. Samples is the maximum budget; see [adaptive sampling](adaptive-sampling.md).
 - Textures: Original, Compressed (BC4/BC7), or Virtual (inactive); see [texture settings](textures.md).
 - Limits: diffuse, reflection, refraction limits, Russian roulette start depth,
   and **Reduce Analytic Light Caustics** (off by default).
-- Image: display exposure in stops. Floating-point exposure edits reprocess the
+- Image: **Sample Count Heat Map AOV** (off by default), plus display exposure in stops.
+  See [sample count diagnostic](sample-count-aov.md) for the color scale and
+  viewport selection. Floating-point exposure edits reprocess the
   existing filtered image on the GPU without clearing history or restarting the
   sample counter, including after convergence.
 
@@ -25,8 +29,7 @@ settings-primitive header, camera/resolution controls, and grouped tabs:
 The node authors `/Render/Lava` by default. Select that prim in the Solaris
 viewport's Render Settings Prim selector if viewport overrides are active.
 Camera optics, focus distance and f-stop remain on the standard Camera LOP.
-No unsupported render products, output formats, denoisers, or adaptive sampling
-controls are exposed.
+Only implemented controls and the sample-count diagnostic output are exposed.
 
 **Reduce Analytic Light Caustics** is an opt-in biased firefly control for both
 interactive and final rendering. It caps the largest RGB component of reflected
@@ -41,6 +44,9 @@ geometry. USD uses `lava:reduceAnalyticCaustics`; JSON scenes use
 
 Connect Lava Light Properties after light creation. Its Primitives field accepts
 Solaris selection patterns. It exposes exactly two renderer controls:
+
+Standard Solaris light **Angle**, **Diffuse** and **Specular** controls are also
+supported; see [light inputs](light-inputs.md) for their behavior.
 
 | Control | Default | Applies to |
 | --- | --- | --- |

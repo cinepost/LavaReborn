@@ -191,6 +191,9 @@ def extract(stage, camera_path, frame):
         if prim.GetTypeName()=="RenderSettings":
             attr=prim.GetAttribute("lava:visibility")
             if attr and attr.Get(time) is not None:scene.setdefault("settings",{})["visibility"]=str(attr.Get(time))
+            for source,target,convert in [('adaptiveSampling','adaptive_sampling',bool),('adaptiveThreshold','adaptive_threshold',float),('adaptiveMinSamples','adaptive_min_samples',int)]:
+                value=prim.GetAttribute('lava:'+source)
+                if value and value.Get(time) is not None:scene.setdefault('settings',{})[target]=convert(value.Get(time))
             chunk=prim.GetAttribute("lava:uploadChunkMiB")
             if chunk and chunk.Get(time) is not None:scene.setdefault("settings",{})["upload_chunk_mib"]=int(chunk.Get(time))
             caustics=prim.GetAttribute("lava:reduceAnalyticCaustics")
@@ -280,6 +283,12 @@ def extract(stage, camera_path, frame):
                 elif interpolation==UsdGeom.Tokens.constant:
                     target["texcoord_indices"]=[0]*len(kept_indices)
             bind_material(scene["meshes"][-1],prim,time)
+            if scene["meshes"][-1]["geometry_light"]:
+                def light_response(name):
+                    attribute=prim.GetAttribute('inputs:'+name)
+                    value=attribute.Get(time) if attribute else None
+                    return float(value) if value is not None else 1.
+                scene["meshes"][-1]['light_response']=[light_response('diffuse'),light_response('specular')]
         elif prim.HasAPI(UsdLux.LightAPI):
             api = UsdLux.LightAPI(prim)
             def attr(name, fallback):
@@ -287,12 +296,13 @@ def extract(stage, camera_path, frame):
                 value = a.Get(time) if a else None
                 return fallback if value is None else value
             light = {"color": list(api.GetColorAttr().Get(time) or Gf.Vec3f(1)),
-                     "intensity": float(attr("inputs:intensity", 1)) * 2 ** float(attr("inputs:exposure", 0))}
+                     "intensity": float(attr("inputs:intensity", 1)) * 2 ** float(attr("inputs:exposure", 0)),
+                     "diffuse": float(attr("inputs:diffuse", 1)), "specular": float(attr("inputs:specular", 1))}
             position = list(matrix.Transform(Gf.Vec3d(0)))
             direction = list(matrix.TransformDir(Gf.Vec3d(0, 0, -1)).GetNormalized())
             cone = float(attr("inputs:shaping:cone:angle", 180))
             if prim.IsA(UsdLux.DistantLight):
-                light.update(type="directional", direction=direction)
+                light.update(type="directional", direction=direction, angle=max(0., min(359.999,float(attr("inputs:angle", .53)))))
             elif prim.IsA(UsdLux.RectLight):
                 light.update(type="area", position=position,
                              single_sided=bool(attr("primvars:lava:singleSided", True)),

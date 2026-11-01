@@ -444,6 +444,8 @@ fn profile_scene_visibility_shadows_shading() {
             reduce_analytic_caustics: scene.settings.reduce_analytic_caustics as u32,
             mesh_triangles: r.mesh_triangles,
             curve_count: r.curve_count,
+            adaptive_threshold: scene.settings.adaptive_threshold,
+            adaptive_min_samples: scene.settings.adaptive_min_samples,
         };
         let visibility = probe.measure(&r, &push, r.passes[0].pipeline, 0);
         r.device

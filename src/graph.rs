@@ -48,7 +48,7 @@ impl Graph {
                 },
                 Pass {
                     name: "accumulation".into(),
-                    inputs: vec![0, 1],
+                    inputs: vec![1],
                     outputs: vec![2, 3],
                 },
                 Pass {

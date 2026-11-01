@@ -40,11 +40,21 @@ fn valid(path: &Path) -> bool {
             .output()
             .is_ok_and(|o| o.status.success())
 }
+#[allow(dead_code)] // Build scripts can request only explicitly defined products.
 pub fn compile(
     source: &Path,
     product: &str,
     output: &Path,
     includes: &[PathBuf],
+) -> io::Result<bool> {
+    compile_with_defines(source, product, output, includes, &[])
+}
+pub fn compile_with_defines(
+    source: &Path,
+    product: &str,
+    output: &Path,
+    includes: &[PathBuf],
+    defines: &[&str],
 ) -> io::Result<bool> {
     let backend =
         std::env::var("LAVA_SHADER_COMPILER").unwrap_or_else(|_| "glslangValidator".into());
@@ -56,6 +66,9 @@ pub fn compile(
     // glslang preprocessing records every transitive include, including vendored LUTs.
     let mut pre = Command::new("glslangValidator");
     pre.arg("-E");
+    for define in defines {
+        pre.arg(format!("-D{define}"));
+    }
     for include in includes {
         pre.arg(format!("-I{}", include.display()));
     }
@@ -118,6 +131,9 @@ pub fn compile(
         ]);
     } else {
         command.args(["-V", "--target-env", "vulkan1.2"]);
+    }
+    for define in defines {
+        command.arg(format!("-D{define}"));
     }
     for include in includes {
         command.arg(format!("-I{}", include.display()));

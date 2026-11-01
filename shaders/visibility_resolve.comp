@@ -1,6 +1,9 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#ifdef LAVA_ADAPTIVE
+#include "adaptive_mask.glsl"
+#endif
 #include "camera.glsl"
 #include "light_bvh.glsl"
 layout(rgba32ui,set=0,binding=15) uniform readonly uimage2D rasterHits;
@@ -8,7 +11,11 @@ layout(rgba32ui,set=0,binding=16) uniform readonly uimage2D rasterAttributes;
 layout(local_size_x=8,local_size_y=8) in;
 void main(){
  uvec2 p=gl_GlobalInvocationID.xy;if(any(greaterThanEqual(p,uvec2(pc.width,pc.height))))return;
- uint i=p.y*pc.width+p.x;uvec4 data=imageLoad(rasterHits,ivec2(p));
+ uint i=p.y*pc.width+p.x;
+#ifdef LAVA_ADAPTIVE
+ if(!adaptiveEligible(i))return;
+#endif
+ uvec4 data=imageLoad(rasterHits,ivec2(p));
  hits[i]=Hit(data.x,uintBitsToFloat(data.y),uintBitsToFloat(data.z),uintBitsToFloat(data.w),imageLoad(rasterAttributes,ivec2(p)));
  vec3 origin,direction;float plane;cameraRay(p,origin,direction,plane);
  float closest=(data.x==0u?camera.clippingOffset.y:hits[i].distance)*plane;uint emitter;

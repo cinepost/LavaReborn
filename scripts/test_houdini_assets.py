@@ -27,6 +27,24 @@ s=l.stage();assert not l.errors(),l.errors()
 p=s.GetPrimAtPath('/Render/Lava')
 assert p.GetTypeName()=='RenderSettings'
 assert p.GetAttribute('lava:samples').Get()==64
+assert p.GetAttribute('lava:adaptiveSampling').Get() is False
+assert abs(p.GetAttribute('lava:adaptiveThreshold').Get()-.03)<1e-6
+assert p.GetAttribute('lava:adaptiveMinSamples').Get()==16
+r.parm('adaptive_sampling').set(True);r.parm('adaptive_threshold').set(.02);r.parm('adaptive_min_samples').set(32)
+cooked=r.stage();adaptive=extract(cooked,'/cameras/camera1',1)['settings']
+assert adaptive['adaptive_sampling'] and abs(adaptive['adaptive_threshold']-.02)<1e-6 and adaptive['adaptive_min_samples']==32
+r.parm('adaptive_sampling').set(False)
+assert r.parm('sample_count_aov').eval()==0
+assert not r.stage().GetPrimAtPath('/Render/Lava').GetRelationship('products').GetTargets()
+r.parm('sample_count_aov').set(True)
+cooked=r.stage()
+assert cooked.GetPrimAtPath('/Render/Lava/SampleCount').GetAttribute('sourceName').Get()=='sampleCount'
+assert cooked.GetPrimAtPath('/Render/Lava/SampleCount').GetAttribute('driver:parameters:aov:name').Get()=='sampleCount'
+assert cooked.GetPrimAtPath('/Render/Lava/LavaDiagnostics').GetRelationship('orderedVars').GetTargets()==[Sdf.Path('/Render/Lava/DiagnosticBeauty'),Sdf.Path('/Render/Lava/SampleCount')]
+assert cooked.GetPrimAtPath('/Render/Lava').GetRelationship('products').GetTargets()==[Sdf.Path('/Render/Lava/LavaDiagnostics')]
+r.parm('sample_count_aov').set(False)
+assert not r.stage().GetPrimAtPath('/Render/Lava').GetRelationship('products').GetTargets()
+
 samples_template=r.parm('samples').parmTemplate()
 assert samples_template.minValue()==1 and samples_template.maxValue()==1024
 assert samples_template.minIsStrict() and samples_template.maxIsStrict()

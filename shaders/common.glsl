@@ -42,8 +42,17 @@ layout(push_constant) uniform Settings {
   uint reduceAnalyticCaustics;
   uint meshTriangles;
   uint curveCount;
+  float adaptiveThreshold;
+  uint adaptiveMinSamples;
 }
 pc;
+#ifdef LAVA_ADAPTIVE
+struct PixelStatistics { uint count; float mean; float m2; uint stable; };
+layout(std430,set=0,binding=23) buffer AdaptiveStatistics { PixelStatistics pixelStats[]; };
+layout(std430,set=0,binding=24) buffer AdaptivePixels { uint activePixels[]; };
+layout(std430,set=0,binding=25) buffer AdaptiveControl { uint activeCount; uint pad0; uint pad1; uint pad2; uvec4 activeDispatch; };
+uint activeInvocation() { return (gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64u+gl_LocalInvocationIndex; }
+#endif
 uint hash(uint x) {
   x ^= x >> 16;
   x *= 0x7feb352du;

@@ -7,6 +7,7 @@ struct Light {
   vec4 color_power;
   vec4 u_soft;
   vec4 v;
+  vec4 response;
   uvec4 bvh;
 };
 layout(std430,set=0,binding=2) readonly buffer Lights { Light lights[]; };
@@ -46,8 +47,23 @@ float lightPmf(uint light,vec3 p) {
 float emitterCosine(Light l,vec3 normal,vec3 direction) {
  float c=dot(normal,-direction);return (l.bvh.y&1u)!=0u?max(0.,c):abs(c);
 }
+float distantSolidAngle(Light l) {return 2.*PI*l.response.z;}
+bool finiteDistant(Light l) {return l.position_kind.w==3.&&l.response.z>1e-12&&l.response.w>0.;}
+vec3 sampleDistant(Light l,inout uint seed) {
+ vec3 axis=-normalize(l.direction_cone.xyz);
+ if(!finiteDistant(l))return axis;
+ float d=l.response.z*pathSample(seed),phi=2.*PI*pathSample(seed);
+ float sine=sqrt(max(0.,d*(2.-d)));
+ vec3 u=normalize(cross(abs(axis.z)<.999?vec3(0,0,1):vec3(0,1,0),axis));
+ return normalize(axis*(1.-d)+sine*(u*cos(phi)+cross(axis,u)*sin(phi)));
+}
+float responseForCategory(vec2 response,uint category) {return category==0u?1.:(category==1u?response.x:response.y);}
+float lightResponse(uint id,uint category) {return responseForCategory(lights[id].response.xy,category);}
+vec3 distantRadiance(uint id) {Light l=lights[id];return l.color_power.rgb*l.color_power.w/l.response.w;}
 float lightPdf(uint index,vec3 origin,vec3 target,vec3 direction) {
-  Light l=lights[index];vec3 n=cross(l.u_soft.xyz,l.v.xyz);
+  Light l=lights[index];
+  if(finiteDistant(l))return lightPmf(index,origin)/distantSolidAngle(l);
+  vec3 n=cross(l.u_soft.xyz,l.v.xyz);
   float area=length(n),cosine=emitterCosine(l,n/max(area,1e-20),direction);
   return cosine>0.?lightPmf(index,origin)*dot(target-origin,target-origin)/(area*cosine):0.;
 }

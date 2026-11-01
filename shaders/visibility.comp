@@ -7,11 +7,20 @@
 #include "camera.glsl"
 #include "materials/visibility.glsl"
 #include "query.glsl"
+#ifdef LAVA_ADAPTIVE
+layout(local_size_x=64) in;
+#else
 layout(local_size_x = 8, local_size_y = 8) in;
+#endif
 // Retain the unified traversal as a specialization product for regression / timing.
 layout(constant_id=50) const bool polygonFirst=false;
 void main() {
+#ifdef LAVA_ADAPTIVE
+  uint slot=activeInvocation();if(slot>=activeCount)return;
+  uint pixel=activePixels[slot];uvec2 p=uvec2(pixel%pc.width,pixel/pc.width);
+#else
   uvec2 p = gl_GlobalInvocationID.xy;
+#endif
   if (any(greaterThanEqual(p, uvec2(pc.width, pc.height))))
     return;
   uint i=p.y*pc.width+p.x;

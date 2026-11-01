@@ -16,6 +16,14 @@ fn main() {
         "shading",
         "accumulation",
         "tonemap",
+        "sample_count",
+        "sample_count_adaptive",
+        "adaptive_prepare",
+        "adaptive_finalize",
+        "visibility_adaptive",
+        "shading_adaptive",
+        "accumulation_adaptive",
+        "visibility_resolve_adaptive",
         "queue_prepare",
         "queue_reorder",
         "queue_reorder_test",
@@ -28,13 +36,19 @@ fn main() {
         "curves.mesh",
         "curves.frag",
     ] {
-        let source = PathBuf::from(if pass.contains('.') {
-            format!("shaders/{pass}")
+        let base = pass.strip_suffix("_adaptive").unwrap_or(pass);
+        let base = if base == "sample_count" {
+            "tonemap"
         } else {
-            format!("shaders/{pass}.comp")
+            base
+        };
+        let source = PathBuf::from(if base.contains('.') {
+            format!("shaders/{base}")
+        } else {
+            format!("shaders/{base}.comp")
         });
         let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(format!("{pass}.spv"));
-        let hit = compiler::compile(
+        let hit = compiler::compile_with_defines(
             &source,
             pass,
             &output,
@@ -43,6 +57,15 @@ fn main() {
                 "shaders/materials".into(),
                 "third_party/openpbr".into(),
             ],
+            if pass == "sample_count_adaptive" {
+                &["LAVA_SAMPLE_COUNT=1", "LAVA_ADAPTIVE=1"]
+            } else if pass == "sample_count" {
+                &["LAVA_SAMPLE_COUNT=1"]
+            } else if pass.ends_with("_adaptive") {
+                &["LAVA_ADAPTIVE=1"]
+            } else {
+                &[]
+            },
         )
         .unwrap_or_else(|e| panic!("Shader compilation failed: {e}"));
         println!(

@@ -18,13 +18,26 @@ pub struct GpuFrame {
     pub width: u32,
     pub height: u32,
     pub samples: u32,
+    pub sample_count_aov: bool,
     pub serial: u64,
     state: Mutex<State>,
 }
 impl GpuFrame {
     pub fn new(device: Arc<Device>, width: u32, height: u32, samples: u32) -> Result<Self> {
+        Self::with_sample_count(device, width, height, samples, false)
+    }
+    pub fn with_sample_count(
+        device: Arc<Device>,
+        width: u32,
+        height: u32,
+        samples: u32,
+        sample_count_aov: bool,
+    ) -> Result<Self> {
         unsafe {
-            let buffer = Buffer::exported(device.clone(), width as u64 * height as u64 * 32)?;
+            let buffer = Buffer::exported(
+                device.clone(),
+                width as u64 * height as u64 * if sample_count_aov { 48 } else { 32 },
+            )?;
             let mut export = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
             let info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
@@ -43,6 +56,7 @@ impl GpuFrame {
                 width,
                 height,
                 samples,
+                sample_count_aov,
                 serial: {
                     static SERIAL: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(1);
@@ -173,7 +187,7 @@ impl GpuFrame {
                 );
             }
         })?;
-        let data = staging.read_floats(self.width as usize * self.height as usize * 8)?;
+        let data = staging.read_floats((self.buffer.size / 4) as usize)?;
         state.readback = Some(data.clone());
         Ok(data)
     }
@@ -181,9 +195,14 @@ impl GpuFrame {
         let n = self.width as usize * self.height as usize;
         Ok(self.read_packed()?[..n * 4].to_vec())
     }
+    pub fn read_sample_count(&self) -> Result<Vec<f32>> {
+        ensure!(self.sample_count_aov, "sampleCount AOV was not requested");
+        let n = self.width as usize * self.height as usize;
+        Ok(self.read_packed()?[n * 8..n * 12].to_vec())
+    }
     pub fn read_depth(&self) -> Result<Vec<f32>> {
         let n = self.width as usize * self.height as usize;
-        Ok(self.read_packed()?[n * 4..]
+        Ok(self.read_packed()?[n * 4..n * 8]
             .iter()
             .step_by(4)
             .copied()

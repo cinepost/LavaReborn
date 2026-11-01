@@ -36,7 +36,10 @@ typedef struct LavaGpuInfo {
   uint32_t width, height, samples;
   uint64_t serial;
   uint8_t uuid[16];
+  uint32_t flags; // bit 0: sampleCount heat-map plane is present
 } LavaGpuInfo;
+int64_t lava_poll_sample_count(LavaSession *, uint64_t revision, float *,
+                               size_t capacity);
 void lava_enable_interop(LavaSession *, bool);
 uint64_t lava_image_readback_count(void);
 uint64_t lava_gpu_presentation_count(void);

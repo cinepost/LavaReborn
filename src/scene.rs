@@ -46,6 +46,8 @@ pub struct Mesh {
     /// USD geometry light: only primary visibility is controlled here.
     #[serde(default)]
     pub geometry_light: bool,
+    #[serde(default = "unit_response")]
+    pub light_response: [f32; 2],
     #[serde(default)]
     pub render_light_geometry: bool,
 }
@@ -56,12 +58,20 @@ pub enum Light {
         position: [f32; 3],
         color: [f32; 3],
         intensity: f32,
+        #[serde(default = "one")]
+        diffuse: f32,
+        #[serde(default = "one")]
+        specular: f32,
     },
     Spot {
         position: [f32; 3],
         direction: [f32; 3],
         color: [f32; 3],
         intensity: f32,
+        #[serde(default = "one")]
+        diffuse: f32,
+        #[serde(default = "one")]
+        specular: f32,
         cone_degrees: f32,
         softness: f32,
     },
@@ -71,15 +81,25 @@ pub enum Light {
         v: [f32; 3],
         color: [f32; 3],
         intensity: f32,
+        #[serde(default = "one")]
+        diffuse: f32,
+        #[serde(default = "one")]
+        specular: f32,
         #[serde(default = "default_true")]
         single_sided: bool,
         #[serde(default)]
         render_light_geometry: bool,
     },
     Directional {
+        #[serde(default)]
+        angle: f32,
         direction: [f32; 3],
         color: [f32; 3],
         intensity: f32,
+        #[serde(default = "one")]
+        diffuse: f32,
+        #[serde(default = "one")]
+        specular: f32,
     },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,7 +134,14 @@ pub struct GpuLight {
     pub color_power: [f32; 4],
     pub u_soft: [f32; 4],
     pub v: [f32; 4],
+    pub response: [f32; 4], // diffuse, specular, 1-cos(angular radius), projected solid angle
     pub bvh: [u32; 4],
+}
+fn unit_response() -> [f32; 2] {
+    [1.; 2]
+}
+fn one() -> f32 {
+    1.
 }
 fn default_true() -> bool {
     true
@@ -174,7 +201,17 @@ impl Scene {
                 l.color_power.iter().all(|v| *v >= 0.),
                 "negative light color or intensity"
             );
+            ensure!(
+                l.response.iter().all(|v| v.is_finite() && *v >= 0.),
+                "invalid light response"
+            );
             let k = l.position_kind[3] as u32;
+            if k == 3 {
+                ensure!(
+                    (0. ..360.).contains(&l.direction_cone[3]),
+                    "invalid distant light angle"
+                );
+            }
             if k == 1 || k == 3 {
                 ensure!(
                     Vec3::new(
@@ -217,6 +254,12 @@ impl Scene {
         let mut diagnostics = GeometryDiagnostics::default();
         for (material_id, mesh) in self.meshes.iter().enumerate() {
             mesh.material.validate()?;
+            ensure!(
+                mesh.light_response
+                    .iter()
+                    .all(|v| v.is_finite() && *v >= 0.),
+                "invalid mesh light response"
+            );
             ensure!(
                 (0. ..=1.).contains(&mesh.material.metallic)
                     && (0. ..=1.).contains(&mesh.material.transmission)
@@ -383,6 +426,7 @@ impl Scene {
                     color_power: [0.; 4],
                     u_soft: [0.; 4],
                     v: [0.; 4],
+                    response: [1., 1., 0., 0.],
                     bvh: [0; 4],
                 };
                 match *l {
@@ -390,21 +434,29 @@ impl Scene {
                         position,
                         color,
                         intensity,
+                        diffuse,
+                        specular,
                     } => {
                         g.position_kind = v4(position, 0.);
                         g.color_power = v4(color, intensity);
+                        g.response[0] = diffuse;
+                        g.response[1] = specular;
                     }
                     Light::Spot {
                         position,
                         direction,
                         color,
                         intensity,
+                        diffuse,
+                        specular,
                         cone_degrees,
                         softness,
                     } => {
                         g.position_kind = v4(position, 1.);
                         g.direction_cone = v4(direction, cone_degrees);
                         g.color_power = v4(color, intensity);
+                        g.response[0] = diffuse;
+                        g.response[1] = specular;
                         g.u_soft[3] = softness;
                     }
                     Light::Area {
@@ -413,6 +465,8 @@ impl Scene {
                         v,
                         color,
                         intensity,
+                        diffuse,
+                        specular,
                         single_sided,
                         render_light_geometry,
                     } => {
@@ -420,17 +474,32 @@ impl Scene {
                             u32::from(single_sided) | (u32::from(render_light_geometry) << 1);
                         g.position_kind = v4(position, 2.);
                         g.color_power = v4(color, intensity);
+                        g.response[0] = diffuse;
+                        g.response[1] = specular;
                         g.u_soft = v4(u, 0.);
                         g.v = v4(v, 0.);
                     }
                     Light::Directional {
+                        angle,
                         direction,
                         color,
                         intensity,
+                        diffuse,
+                        specular,
                     } => {
                         g.position_kind[3] = 3.;
-                        g.direction_cone = v4(direction, 0.);
+                        g.direction_cone = v4(direction, angle);
+                        let radius = (angle as f64 * 0.5).to_radians();
+                        g.response[2] = (2. * (radius * 0.5).sin().powi(2)) as f32;
+                        g.response[3] = (std::f64::consts::PI
+                            * if radius <= std::f64::consts::FRAC_PI_2 {
+                                radius.sin().powi(2)
+                            } else {
+                                1.
+                            }) as f32;
                         g.color_power = v4(color, intensity);
+                        g.response[0] = diffuse;
+                        g.response[1] = specular;
                     }
                 }
                 g
@@ -549,5 +618,47 @@ impl Scene {
                     && a.geometry_light == b.geometry_light
                     && a.render_light_geometry == b.render_light_geometry
             })
+    }
+}
+
+#[cfg(test)]
+mod light_input_tests {
+    use super::*;
+    #[test]
+    fn light_defaults_angle_bounds_and_tiny_cone_precision() {
+        let mut scene: Scene =
+            serde_json::from_str(include_str!("../examples/studio.json")).unwrap();
+        assert!(scene
+            .gpu_lights()
+            .iter()
+            .all(|l| l.response[..2] == [1., 1.]));
+        scene.lights=vec![serde_json::from_value(serde_json::json!({"type":"directional","direction":[0,0,-1],"color":[1,1,1],"intensity":1})).unwrap()];
+        assert_eq!(scene.gpu_lights()[0].response, [1., 1., 0., 0.]);
+        for angle in [0.00001, 0.53, 120., 359.99] {
+            if let Light::Directional { angle: a, .. } = &mut scene.lights[0] {
+                *a = angle;
+            }
+            scene.validate_parameters().unwrap();
+            let gpu = scene.gpu_lights()[0];
+            assert!(gpu.response[2] > 0. && gpu.response[3] > 0.);
+        }
+        for angle in [-1., 360., f32::NAN] {
+            if let Light::Directional { angle: a, .. } = &mut scene.lights[0] {
+                *a = angle;
+            }
+            assert!(scene.validate_parameters().is_err());
+        }
+        if let Light::Directional {
+            angle,
+            diffuse,
+            specular,
+            ..
+        } = &mut scene.lights[0]
+        {
+            *angle = 0.;
+            *diffuse = -1.;
+            *specular = 1.;
+        }
+        assert!(scene.validate_parameters().is_err());
     }
 }

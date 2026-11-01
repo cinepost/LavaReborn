@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#define LAVA_ADAPTIVE
+#include "common.glsl"
+#include "adaptive_mask.glsl"
+layout(local_size_x=64) in;
+void main() {
+ uint i=activeInvocation();bool eligible=false;
+ if(i<pc.width*pc.height)eligible=adaptiveEligible(i);
+ uvec4 mask=subgroupBallot(eligible);uint count=subgroupBallotBitCount(mask),base=0u;
+ if(count==0u)return;
+ if(subgroupElect())base=atomicAdd(activeCount,count);
+ base=subgroupBroadcastFirst(base);
+ if(eligible)activePixels[base+subgroupBallotExclusiveBitCount(mask)]=i;
+}

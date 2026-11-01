@@ -80,7 +80,48 @@ struct State : HdRenderParam {
   uint64_t curvesGeneration = 0;
   std::map<SdfPath, std::string> meshes, curves, lights, materials;
   std::map<SdfPath, SdfPath> meshMaterials;
+  struct MeshLightSource {
+    UsdPrim prim;
+    UsdImagingDelegate *delegate;
+    float diffuse, specular;
+  };
+  std::map<SdfPath, MeshLightSource> meshLightSources;
 };
+float MeshLightInput(UsdPrim const &prim, char const *name, UsdTimeCode time) {
+  float value = 1.f;
+  auto attribute = prim.GetAttribute(TfToken(std::string("inputs:") + name));
+  if (attribute)
+    attribute.Get(&value, time);
+  return value;
+}
+void SyncMeshLightResponses(State &state) {
+  // Some mesh adapters do not forward LightAPI-only dirty bits. Poll these few
+  // emitter attributes independently; do not re-read or rebuild mesh geometry.
+  for (auto &entry : state.meshLightSources) {
+    auto &source = entry.second;
+    if (!source.prim)
+      continue;
+    auto time = source.delegate->GetTime();
+    float diffuse = MeshLightInput(source.prim, "diffuse", time),
+          specular = MeshLightInput(source.prim, "specular", time);
+    if (diffuse == source.diffuse && specular == source.specular)
+      continue;
+    auto mesh = state.meshes.find(entry.first);
+    if (mesh == state.meshes.end())
+      continue;
+    auto begin = mesh->second.find(",\"light_response\":[");
+    if (begin == std::string::npos)
+      continue;
+    auto end = mesh->second.find(']', begin);
+    lava_json::Writer value;
+    value << ",\"light_response\":[" << diffuse << ',' << specular << ']';
+    mesh->second.replace(begin, end - begin + 1, value.str());
+    source.diffuse = diffuse;
+    source.specular = specular;
+    ++state.generation;
+    ++state.geometryGeneration;
+  }
+}
 class Mesh final : public HdMesh {
 public:
   Mesh(SdfPath const &id) : HdMesh(id) {}
@@ -102,6 +143,7 @@ public:
     auto *state = static_cast<State *>(param);
     if (!d->GetVisible(GetId())) {
       std::lock_guard<std::mutex> lock(state->mutex);
+      state->meshLightSources.erase(GetId());
       if (state->meshes.erase(GetId())) {
         ++state->generation;
         ++state->geometryGeneration;
@@ -250,14 +292,43 @@ public:
         o << ']';
       }
     }
+    bool usdMeshLight = false;
+    float lightDiffuse = 1.f, lightSpecular = 1.f;
+    auto *imaging = dynamic_cast<UsdImagingDelegate *>(d);
+    if (!imaging)
+      imaging = dynamic_cast<UsdImagingDelegate *>(
+          d->GetRenderIndex().GetSceneDelegateForRprim(GetId()));
+    UsdPrim lightPrim;
+    if (imaging) {
+      lava::MeshSourceReader reader;
+      auto prim = reader.Source(imaging, GetId());
+      if (prim) {
+        auto schemas = prim.GetAppliedSchemas();
+        lightPrim = prim;
+        usdMeshLight = std::find(schemas.begin(), schemas.end(),
+                                 TfToken("MeshLightAPI")) != schemas.end();
+        if (usdMeshLight ||
+            BoolPrimvar(d, GetId(), "lava:geometryLight", false)) {
+          lightDiffuse = MeshLightInput(prim, "diffuse", imaging->GetTime());
+          lightSpecular = MeshLightInput(prim, "specular", imaging->GetTime());
+        }
+      }
+    }
+    o << ",\"light_response\":[" << lightDiffuse << ',' << lightSpecular << ']';
     o << ",\"geometry_light\":"
-      << (BoolPrimvar(d, GetId(), "lava:geometryLight", false) ? "true"
-                                                               : "false")
+      << (BoolPrimvar(d, GetId(), "lava:geometryLight", usdMeshLight) ? "true"
+                                                                      : "false")
       << ",\"render_light_geometry\":"
       << (BoolPrimvar(d, GetId(), "lava:renderLightGeometry", false) ? "true"
                                                                      : "false")
       << ",\"color\":" << GfVec3d(color) << '}';
     std::lock_guard<std::mutex> lock(state->mutex);
+    if (lightPrim &&
+        BoolPrimvar(d, GetId(), "lava:geometryLight", usdMeshLight))
+      state->meshLightSources[GetId()] = {lightPrim, imaging, lightDiffuse,
+                                          lightSpecular};
+    else
+      state->meshLightSources.erase(GetId());
     auto serialized = o.str();
     auto materialId = d->GetMaterialId(GetId());
     auto &stored = state->meshes[GetId()];
@@ -497,10 +568,14 @@ public:
                       std::exp2(get(HdLightTokens->exposure, 0));
     std::ostringstream o;
     o << std::setprecision(9) << "{\"color\":" << Vec(GfVec3d(color))
-      << ",\"intensity\":" << intensity;
+      << ",\"intensity\":" << intensity
+      << ",\"diffuse\":" << get(HdLightTokens->diffuse, 1)
+      << ",\"specular\":" << get(HdLightTokens->specular, 1);
     float cone = get(HdLightTokens->shapingConeAngle, 180);
     if (type == HdPrimTypeTokens->distantLight)
-      o << ",\"type\":\"directional\",\"direction\":" << Vec(direction);
+      o << ",\"type\":\"directional\",\"direction\":" << Vec(direction)
+        << ",\"angle\":"
+        << std::clamp(get(HdLightTokens->angle, .53f), 0.f, 359.999f);
     else if (type == HdPrimTypeTokens->rectLight) {
       o << ",\"type\":\"area\",\"position\":" << Vec(position) << ",\"u\":"
         << Vec(matrix.TransformDir(GfVec3d(get(HdLightTokens->width, 1), 0, 0)))
@@ -744,6 +819,7 @@ class Buffer final : public HdRenderBuffer {
   std::shared_ptr<RenderSession> session;
   uint64_t revision = 0;
   bool depth = false;
+  bool sampleCount = false;
   mutable std::unique_ptr<LavaGlInterop> placeholder;
   void readback() {
     if (!session || IsMapped())
@@ -752,10 +828,13 @@ class Buffer final : public HdRenderBuffer {
     if (session->revision != revision)
       return;
     std::vector<float> incoming(pixels.size());
-    auto done = depth ? lava_poll_depth(session->raw, revision, incoming.data(),
-                                        incoming.size())
-                      : lava_poll(session->raw, revision, incoming.data(),
-                                  incoming.size());
+    auto done = sampleCount
+                    ? lava_poll_sample_count(session->raw, revision,
+                                             incoming.data(), incoming.size())
+                : depth ? lava_poll_depth(session->raw, revision,
+                                          incoming.data(), incoming.size())
+                        : lava_poll(session->raw, revision, incoming.data(),
+                                    incoming.size());
     auto channels = depth ? 1u : 4u;
     if (done > 0)
       for (unsigned y = 0; y < GetHeight(); ++y)
@@ -807,10 +886,12 @@ public:
     return session->revision == revision &&
            session->status() >= int64_t(session->target);
   }
-  void Bind(std::shared_ptr<RenderSession> const &s, uint64_t r) {
+  void Bind(std::shared_ptr<RenderSession> const &s, uint64_t r,
+            bool diagnostic = false) {
     std::lock_guard<std::mutex> l(pixelsMutex);
     session = s;
     revision = r;
+    sampleCount = diagnostic;
   }
   VtValue GetResource(bool) const override {
     std::lock_guard<std::mutex> lock(pixelsMutex);
@@ -820,8 +901,9 @@ public:
       try {
         if (!placeholder)
           placeholder = std::make_unique<LavaGlInterop>();
-        return VtValue(
-            placeholder->Get(nullptr, 0, depth, GetWidth(), GetHeight()));
+        return VtValue(placeholder->Get(nullptr, 0,
+                                        sampleCount ? 2 : unsigned(depth),
+                                        GetWidth(), GetHeight()));
       } catch (std::exception const &) {
         return VtValue();
       }
@@ -833,8 +915,9 @@ public:
     try {
       if (!session->gl)
         session->gl = std::make_unique<LavaGlInterop>();
-      auto texture = session->gl->Get(session->raw, revision, depth, GetWidth(),
-                                      GetHeight());
+      auto texture = session->gl->Get(session->raw, revision,
+                                      sampleCount ? 2 : unsigned(depth),
+                                      GetWidth(), GetHeight());
       if (texture)
         return VtValue(texture);
     } catch (std::exception const &e) {
@@ -960,6 +1043,7 @@ public:
     {
       std::lock_guard<std::mutex> lock(state.mutex);
       state.meshes.erase(p->GetId());
+      state.meshLightSources.erase(p->GetId());
       if (state.curves.erase(p->GetId()))
         ++state.curvesGeneration;
       ++state.generation;
@@ -1001,34 +1085,42 @@ public:
   void DestroyBprim(HdBprim *p) override { delete p; }
   void CommitResources(HdChangeTracker *) override {}
   HdAovDescriptor GetDefaultAovDescriptor(TfToken const &name) const override {
-    if (name == HdAovTokens->color)
+    if (std::getenv("LAVA_TRACE"))
+      std::fprintf(stderr, "Lava AOV descriptor: %s\n", name.GetText());
+    if (name == HdAovTokens->color || name == TfToken("sampleCount"))
       return HdAovDescriptor(HdFormatFloat32Vec4, false, VtValue(GfVec4f(0)));
     if (name == HdAovTokens->depth)
       return HdAovDescriptor(HdFormatFloat32, false, VtValue(1e30f));
     return HdAovDescriptor();
   }
   HdRenderSettingDescriptorList GetRenderSettingDescriptors() const override {
-    return {{"Visibility generator (ray_query or raster)",
-             TfToken("lava:visibility"), VtValue(std::string("ray_query"))},
-            {"Rendering path", TfToken("lava:mode"),
-             VtValue(std::string("interactive"))},
-            {"Samples", TfToken("lava:samples"), VtValue(64)},
-            {"Geometry upload chunk size (MiB)", TfToken("lava:uploadChunkMiB"),
-             VtValue(16)},
-            {"Exposure", TfToken("lava:exposure"), VtValue(0.f)},
-            {"Texture mode", TfToken("lava:textures"),
-             VtValue(std::string("original"))},
-            {"Maximum diffuse depth", TfToken("lava:diffuseDepth"), VtValue(3)},
-            {"Maximum reflection depth", TfToken("lava:reflectionDepth"),
-             VtValue(4)},
-            {"Maximum refraction depth", TfToken("lava:refractionDepth"),
-             VtValue(8)},
-            {"Russian roulette start depth", TfToken("lava:rouletteStart"),
-             VtValue(3)},
-            {"Reduce analytic light caustics",
-             TfToken("lava:reduceAnalyticCaustics"), VtValue(false)},
-            {"Automatic viewport headlight", TfToken("lava:headlight"),
-             VtValue(true)}};
+    return {
+        {"Visibility generator (ray_query or raster)",
+         TfToken("lava:visibility"), VtValue(std::string("ray_query"))},
+        {"Rendering path", TfToken("lava:mode"),
+         VtValue(std::string("interactive"))},
+        {"Samples", TfToken("lava:samples"), VtValue(64)},
+        {"Adaptive sampling", TfToken("lava:adaptiveSampling"), VtValue(false)},
+        {"Adaptive relative error", TfToken("lava:adaptiveThreshold"),
+         VtValue(.03f)},
+        {"Adaptive minimum samples", TfToken("lava:adaptiveMinSamples"),
+         VtValue(16)},
+        {"Geometry upload chunk size (MiB)", TfToken("lava:uploadChunkMiB"),
+         VtValue(16)},
+        {"Exposure", TfToken("lava:exposure"), VtValue(0.f)},
+        {"Texture mode", TfToken("lava:textures"),
+         VtValue(std::string("original"))},
+        {"Maximum diffuse depth", TfToken("lava:diffuseDepth"), VtValue(3)},
+        {"Maximum reflection depth", TfToken("lava:reflectionDepth"),
+         VtValue(4)},
+        {"Maximum refraction depth", TfToken("lava:refractionDepth"),
+         VtValue(8)},
+        {"Russian roulette start depth", TfToken("lava:rouletteStart"),
+         VtValue(3)},
+        {"Reduce analytic light caustics",
+         TfToken("lava:reduceAnalyticCaustics"), VtValue(false)},
+        {"Automatic viewport headlight", TfToken("lava:headlight"),
+         VtValue(true)}};
   }
 };
 void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
@@ -1045,17 +1137,24 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
   }
   Buffer *output = nullptr;
   Buffer *depthOutput = nullptr;
+  Buffer *sampleCountOutput = nullptr;
   for (auto const &a : passState->GetAovBindings())
-    if (a.aovName == HdAovTokens->color || a.aovName == HdAovTokens->depth) {
+    if (a.aovName == HdAovTokens->color || a.aovName == HdAovTokens->depth ||
+        a.aovName == TfToken("sampleCount")) {
       auto *buffer = a.renderBuffer;
       if (!buffer && !a.renderBufferId.IsEmpty())
         buffer = dynamic_cast<HdRenderBuffer *>(GetRenderIndex()->GetBprim(
             HdPrimTypeTokens->renderBuffer, a.renderBufferId));
       if (a.aovName == HdAovTokens->color)
         output = dynamic_cast<Buffer *>(buffer);
+      else if (a.aovName == TfToken("sampleCount"))
+        sampleCountOutput = dynamic_cast<Buffer *>(buffer);
       else
         depthOutput = dynamic_cast<Buffer *>(buffer);
     }
+  Buffer *beautyOutput = output;
+  if (!output)
+    output = sampleCountOutput;
   if (trace)
     std::fprintf(stderr, "Lava color buffer=%p, size=%ux%u\n",
                  static_cast<void *>(output), output ? output->GetWidth() : 0,
@@ -1069,7 +1168,8 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     return std::clamp(delegate->GetRenderSetting(TfToken(name), fallback), 0,
                       maximum);
   };
-  o << std::setprecision(9) << "{\"settings\":{\"visibility\":\""
+  o << std::setprecision(9) << "{\"settings\":{\"sample_count_aov\":"
+    << (sampleCountOutput ? "true" : "false") << ",\"visibility\":\""
     << delegate->GetRenderSetting(TfToken("lava:visibility"),
                                   std::string("ray_query"))
     << "\",\"textures\":\""
@@ -1080,6 +1180,16 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     << delegate->GetRenderSetting(TfToken("lava:uploadChunkMiB"), 16)
     << ",\"reflection_depth\":" << depth("lava:reflectionDepth", 4, 32)
     << ",\"refraction_depth\":" << depth("lava:refractionDepth", 8, 32)
+    << ",\"adaptive_sampling\":"
+    << (delegate->GetRenderSetting(TfToken("lava:adaptiveSampling"), false)
+            ? "true"
+            : "false")
+    << ",\"adaptive_threshold\":"
+    << delegate->GetRenderSetting(TfToken("lava:adaptiveThreshold"), .03f)
+    << ",\"adaptive_min_samples\":"
+    << std::clamp(
+           delegate->GetRenderSetting(TfToken("lava:adaptiveMinSamples"), 16),
+           2, 1024)
     << ",\"roulette_start\":" << depth("lava:rouletteStart", 3, 96)
     << ",\"reduce_analytic_caustics\":"
     << (delegate->GetRenderSetting(TfToken("lava:reduceAnalyticCaustics"),
@@ -1111,6 +1221,7 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
   uint64_t generation, geometryGeneration, curvesGeneration;
   {
     std::lock_guard<std::mutex> lock(state.mutex);
+    SyncMeshLightResponses(state);
     generation = state.generation;
     geometryGeneration = state.geometryGeneration;
     curvesGeneration = state.curvesGeneration;
@@ -1225,7 +1336,10 @@ void Pass::_Execute(HdRenderPassStateSharedPtr const &passState,
     }
     previous = key;
   }
-  output->Bind(session, revision);
+  if (beautyOutput)
+    beautyOutput->Bind(session, revision);
+  if (sampleCountOutput)
+    sampleCountOutput->Bind(session, revision, true);
   if (depthOutput)
     depthOutput->Bind(session, revision);
   {

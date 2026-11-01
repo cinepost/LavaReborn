@@ -33,6 +33,7 @@ pub struct Frame {
     pub interactive: bool,
     pub pixels: Vec<f32>,
     pub depth: Vec<f32>,
+    pub sample_count_image: Vec<f32>,
     pub gpu: Option<Arc<crate::interop::GpuFrame>>,
 }
 pub struct Worker {
@@ -134,6 +135,7 @@ impl Worker {
                                 })
                         });
                         if display_only {
+                            renderer.set_sample_count_aov(r.parameters().settings.sample_count_aov);
                             renderer
                                 .set_upload_chunk_mib(r.parameters().settings.upload_chunk_mib)?;
                             renderer.gpu_output = r.gpu_output;
@@ -257,6 +259,7 @@ impl Worker {
                                 interactive: r.mode == Mode::Interactive,
                                 pixels,
                                 depth: renderer.depth.clone(),
+                                sample_count_image: renderer.sample_count_image.clone(),
                                 gpu: renderer.gpu_frame.clone(),
                             });
                         }
@@ -726,6 +729,38 @@ mod tests {
                     reads
                 );
                 assert_eq!(frame.read_color().unwrap(), original);
+            }
+            for enabled in [true, false, true, false] {
+                if let Some(view) = request.view.as_mut() {
+                    Arc::make_mut(view).settings.sample_count_aov = enabled;
+                } else {
+                    Arc::make_mut(&mut request.scene).settings.sample_count_aov = enabled;
+                }
+                let reads = crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed);
+                let revision = worker.submit(request.clone()).unwrap();
+                let frame = wait(&worker, revision, false, 8);
+                assert_eq!(
+                    frame.serial,
+                    previous_serial + 1,
+                    "AOV toggle restarted sampling"
+                );
+                previous_serial = frame.serial;
+                assert_eq!(frame.sample_count_aov, enabled);
+                assert_eq!(frame.buffer.size, 32 * 24 * if enabled { 48 } else { 32 });
+                assert_eq!(
+                    crate::interop::IMAGE_READBACKS.load(Ordering::Relaxed),
+                    reads
+                );
+                assert_eq!(frame.read_color().unwrap(), original);
+                if enabled {
+                    assert!(frame
+                        .read_sample_count()
+                        .unwrap()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| *p == [0.5, 0., 0., 1.]));
+                }
             }
         }
     }

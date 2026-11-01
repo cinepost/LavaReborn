@@ -5,14 +5,27 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
+#ifdef LAVA_ADAPTIVE
+  if(pc.filterPhase==0u) {
+    uint slot=activeInvocation();if(slot>=activeCount)return;
+    uint pixel=activePixels[slot];p=uvec2(pixel%pc.width,pixel/pc.width);
+  }
+#endif
   if (any(greaterThanEqual(p, uvec2(pc.width, pc.height))))
     return;
   uint i = p.y * pc.width + p.x;
   if (pc.filterPhase != 0u) {
     vec3 sum = vec3(0);
     float weights = 0.;
-    // Conservative primitive-aware spatial filter over accumulated linear
-    // HDR.
+    // Guide entirely from accumulated linear HDR. Last-sample primitive IDs,
+    // coverage and depth are stochastic, especially for subpixel curves/DoF.
+    // A symmetric relative RGB range weight preserves luminance/chromatic edges.
+    // Filter unassociated color, then restore the center's accumulated coverage.
+    // Filtering premultiplied RGB against transparent black would darken edges;
+    // replacing alpha with one would fill cutout holes and background pixels.
+    float alpha=clamp(history[i].a,0.,1.);
+    if(alpha<=0.) {filtered[i]=vec4(0);return;}
+    vec3 center=history[i].rgb/alpha;
     int r = int(pc.radius);
     for (int y = -r; y <= r; y++)
       for (int x = -r; x <= r; x++) {
@@ -21,18 +34,40 @@ void main() {
             any(greaterThanEqual(q, ivec2(pc.width, pc.height))))
           continue;
         uint j = uint(q.y) * pc.width + uint(q.x);
-        if (hits[i].primitive != hits[j].primitive)
-          continue;
-        float w = exp(-float(x * x + y * y) * .5);
-        sum += history[j].rgb * w;
+        float coverage=clamp(history[j].a,0.,1.);
+        if(coverage<=0.)continue;
+        vec3 neighbor=history[j].rgb/coverage;
+        vec3 magnitude=max(abs(center),abs(neighbor));
+        float scale=max(max(magnitude.r,max(magnitude.g,magnitude.b)),.01);
+        // Normalize before subtraction/squaring to remain finite for HDR values.
+        vec3 difference=neighbor/scale-center/scale;
+        float w=exp(-float(x*x+y*y)*.5-dot(difference,difference)*50.);
+        sum += neighbor*w;
         weights += w;
       }
 
-    filtered[i] = vec4(sum / max(weights, 1e-6), 1);
+    filtered[i] = vec4((sum / max(weights, 1e-6))*alpha, alpha);
     return;
   }
+#ifdef LAVA_ADAPTIVE
+  PixelStatistics stats=pixelStats[i];uint n=stats.count+1u;
+  history[i]=stats.count==0u?radiance[i]:mix(history[i],radiance[i],1./float(n));
+  float value=dot(radiance[i].rgb,vec3(.2126,.7152,.0722));
+  float delta=value-stats.mean;stats.mean+=delta/float(n);stats.m2+=delta*(value-stats.mean);stats.count=n;
+  if(n>=pc.adaptiveMinSamples && (n&3u)==0u) {
+    float error=1.96*sqrt(max(stats.m2,0.)/(float(n)*float(n-1u)));
+    bool converged=!isnan(error)&&!isinf(error)&&error<=pc.adaptiveThreshold*max(abs(stats.mean),.01);
+    // Coverage is a Bernoulli sample. Its variance follows from the accumulated
+    // alpha, so dark cutouts need no additional statistics buffer to converge.
+    float alphaError=1.96*sqrt(max(history[i].a*(1.-history[i].a),0.)/float(n-1u));
+    converged=converged&&alphaError<=pc.adaptiveThreshold;
+    stats.stable=converged?stats.stable+1u:0u;
+  }
+  pixelStats[i]=stats;
+#else
   // No history read on sample zero, including after resize / scene edits.
   history[i] = pc.sampleIndex == 0 ? radiance[i]
                                    : mix(history[i], radiance[i],
                                          1. / float(pc.sampleIndex + 1u));
+#endif
 }

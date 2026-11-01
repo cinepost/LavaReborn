@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define LAVA_ADAPTIVE
+#include "common.glsl"
+layout(local_size_x=1) in;
+void main() {
+ uint groups=(activeCount+63u)/64u,x=min(groups,pc.maxGroupsX);
+ activeDispatch=uvec4(x,x>0u?(groups+x-1u)/x:1u,1u,0u);
+}

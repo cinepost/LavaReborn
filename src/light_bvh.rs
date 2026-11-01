@@ -54,6 +54,7 @@ impl LightTree {
             };
             let power = Vec3::from_slice(&light.color_power).dot(Vec3::new(0.2126, 0.7152, 0.0722))
                 * light.color_power[3]
+                * light.response[0].max(light.response[1])
                 * if light.position_kind[3] == 2. {
                     area
                 } else {
@@ -157,8 +158,22 @@ impl LightBvh {
                 .all(|v| v.is_finite()),
             "light BVH bounds/power exceed finite float range"
         );
+        let distant: Vec<usize> = lights
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                (l.position_kind[3] == 3. && l.response[2] > 1e-12 && l.response[3] > 0.)
+                    .then_some(i)
+            })
+            .collect();
+        let first = distant.first().map_or(LEAF, |i| *i as u32);
         for (i, l) in lights.iter_mut().enumerate() {
             l.bvh[0] = tree.leaves[i];
+            l.bvh[2] = LEAF; // Next finite distant emitter; no scan of local lights on misses.
+            l.bvh[3] = first;
+        }
+        for pair in distant.windows(2) {
+            lights[pair[0]].bvh[2] = pair[1] as u32;
         }
         let upload = |bytes: &[u8]| -> Result<Buffer> {
             let buffer = Buffer::new(

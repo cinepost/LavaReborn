@@ -65,6 +65,7 @@ fn concave_polygon_preserves_area() {
         normal_indices: Vec::new(),
         reverse_orientation: false,
         geometry_light: false,
+        light_response: [1.; 2],
         render_light_geometry: false,
         texcoords: Vec::new(),
         texcoord_indices: Vec::new(),
@@ -117,6 +118,7 @@ fn triangulation_is_stable_far_from_origin() {
         normal_indices: Vec::new(),
         reverse_orientation: false,
         geometry_light: false,
+        light_response: [1.; 2],
         render_light_geometry: false,
         texcoords: Vec::new(),
         texcoord_indices: Vec::new(),
@@ -141,12 +143,17 @@ fn light_bvh_pdfs_normalize_and_cover_all_emitters() {
     let mut scene: Scene = serde_json::from_str(include_str!("../examples/studio.json")).unwrap();
     scene.lights = (0..37)
         .map(|i| Light::Point {
+            diffuse: 1.,
+            specular: 1.,
             position: [i as f32 - 18., (i % 3) as f32, 2.],
             color: [1.; 3],
             intensity: (i + 1) as f32,
         })
         .collect();
     scene.lights.push(Light::Directional {
+        diffuse: 1.,
+        specular: 1.,
+        angle: 0.,
         direction: [0., 0., -1.],
         color: [1.; 3],
         intensity: 2.,

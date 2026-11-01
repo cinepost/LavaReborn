@@ -10,6 +10,9 @@ vec3 cameraLens(vec2 xi) {
 vec3 cameraLens(){return cameraLens(lensSample());}
 // Shared by ray-query visibility, raster resolve and path initialization.
 void cameraRay(uvec2 p,out vec3 origin,out vec3 direction,out float planeScale) {
+#ifdef LAVA_ADAPTIVE
+ samplingPixel=p.y*pc.width+p.x;
+#endif
  vec2 uv=(vec2(p)+filmSample(p))/vec2(pc.width,pc.height);
  vec2 film=(uv*2.-1.)*vec2(1.,-1.)*camera.optics.xy*.5+camera.clippingOffset.zw;
  vec3 localOrigin=cameraLens(lensSample(p)),localDirection;

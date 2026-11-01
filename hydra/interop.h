@@ -10,7 +10,7 @@ class LavaGlInterop {
 public:
   LavaGlInterop();
   ~LavaGlInterop();
-  HgiTextureHandle Get(LavaSession *, uint64_t revision, bool depth,
+  HgiTextureHandle Get(LavaSession *, uint64_t revision, unsigned plane,
                        unsigned width, unsigned height);
   static bool HasContext();
   static void Retire(LavaGlInterop *);

@@ -338,6 +338,63 @@ pub unsafe extern "C" fn lava_poll(
         f.samples as i64
     }
 }
+/// Read the explicitly requested sampleCount heat-map AOV.
+/// # Safety
+/// Same pointer and serialization requirements as lava_poll.
+#[no_mangle]
+pub unsafe extern "C" fn lava_poll_sample_count(
+    session: *mut Session,
+    revision: u64,
+    output: *mut f32,
+    capacity: usize,
+) -> i64 {
+    if session.is_null() || output.is_null() {
+        return -1;
+    }
+    let s = &mut *session;
+    let Some(worker) = s.worker.as_ref() else {
+        return 0;
+    };
+    let failure = worker.error.lock().unwrap().clone();
+    if let Some((_, e)) = failure.filter(|(r, _)| *r == revision) {
+        s.error(e);
+        return -1;
+    }
+    let frame = worker.frame.lock().unwrap();
+    let Some(f) = frame
+        .as_ref()
+        .filter(|f| f.revision == revision && !f.pending_scene)
+    else {
+        return 0;
+    };
+    let gpu_pixels;
+    let pixels = if let Some(g) = &f.gpu {
+        match g.read_sample_count() {
+            Ok(p) => {
+                gpu_pixels = p;
+                &gpu_pixels
+            }
+            Err(e) => {
+                drop(frame);
+                s.error(e.to_string());
+                return -1;
+            }
+        }
+    } else {
+        &f.sample_count_image
+    };
+    if capacity < pixels.len() {
+        drop(frame);
+        s.error("output capacity too small".into());
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), output, pixels.len());
+    if f.pending_scene {
+        0
+    } else {
+        f.samples as i64
+    }
+}
 #[no_mangle]
 pub extern "C" fn lava_is_supported() -> bool {
     std::panic::catch_unwind(|| {
@@ -431,6 +488,7 @@ pub struct GpuInfo {
     pub samples: u32,
     pub serial: u64,
     pub uuid: [u8; 16],
+    pub flags: u32,
 }
 pub struct GpuLease(std::sync::Arc<crate::interop::GpuFrame>);
 /// Export a new immutable GPU snapshot. Returned lease retains its Vulkan storage.
@@ -484,6 +542,7 @@ pub unsafe extern "C" fn lava_gpu_frame(
         samples: g.samples,
         serial: g.serial,
         uuid: g.buffer.device.uuid,
+        flags: u32::from(g.sample_count_aov),
     };
     Box::into_raw(Box::new(GpuLease(g)))
 }

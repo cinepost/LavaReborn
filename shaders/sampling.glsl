@@ -4,17 +4,36 @@
 // ray-query camera samples have independent pixel scrambles.
 layout(std430,set=0,binding=17) readonly buffer SamplingPrimes {uint samplePrimes[];};
 uint samplingPixel=0u;
+uint pixelSampleIndex() {
+#ifdef LAVA_ADAPTIVE
+ return pixelStats[samplingPixel].count;
+#else
+ return pc.sampleIndex;
+#endif
+}
 float radicalInverse(uint index,uint base) {
  float inverse=1./float(base),weight=inverse,value=0.;
  while(index>0u){value+=float(index%base)*weight;index/=base;weight*=inverse;}
  return min(value,0.99999994);
 }
 float sequenceSample(uint dimension,uint scramble) {
+
+#ifdef LAVA_ADAPTIVE
+ // Raster projection is frame-coherent even when an edge-guard pixel resumes
+ // after skipping iterations. Ray-query cameras retain per-pixel sequences.
+ uint cameraIndex=camera.lens.z>0.?pixelSampleIndex():pc.sampleIndex;
  float value;
- if(pc.samplingMode==0u)value=radicalInverse(pc.sampleIndex+1u,samplePrimes[dimension]);
- else if(dimension==0u)value=(float(pc.sampleIndex)+.5)/float(max(pc.targetSamples,1u));
- else value=radicalInverse(pc.sampleIndex,samplePrimes[dimension-1u]);
+ if(pc.samplingMode==0u)value=radicalInverse(cameraIndex+1u,samplePrimes[dimension]);
+ else if(dimension==0u)value=(float(cameraIndex)+.5)/float(max(pc.targetSamples,1u));
+ else value=radicalInverse(cameraIndex,samplePrimes[dimension-1u]);
  return fract(value+float(hash(scramble^hash(dimension+0x51633e2du))>>8)*(1./16777216.));
+#else
+ float value;
+ if(pc.samplingMode==0u)value=radicalInverse(pixelSampleIndex()+1u,samplePrimes[dimension]);
+ else if(dimension==0u)value=(float(pixelSampleIndex())+.5)/float(max(pc.targetSamples,1u));
+ else value=radicalInverse(pixelSampleIndex(),samplePrimes[dimension-1u]);
+ return fract(value+float(hash(scramble^hash(dimension+0x51633e2du))>>8)*(1./16777216.));
+#endif
 }
 // Nested affine digit permutations are bijective in every prime base. Their
 // pixel/dimension-specific trees avoid reusing camera coordinates for BSDF/NEE
@@ -32,7 +51,7 @@ float scrambledRadicalInverse(uint index,uint base,uint scramble) {
 float pathSample(inout uint dimension) {
  uint d=dimension++,key=hash(samplingPixel)^hash(d+0x51633e2du);
  uint base=samplePrimes[pc.samplingMode==0u?d:d-1u];
- return scrambledRadicalInverse(pc.sampleIndex+(pc.samplingMode==0u?1u:0u),base,key);
+ return scrambledRadicalInverse(pixelSampleIndex()+(pc.samplingMode==0u?1u:0u),base,key);
 }
 vec2 filmSample(){return vec2(sequenceSample(0u,0x71a9u),sequenceSample(1u,0x71a9u));}
 vec2 filmSample(uvec2 p){

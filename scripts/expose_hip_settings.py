@@ -14,6 +14,9 @@ values={
  'lava:textures':(Sdf.ValueTypeNames.String,node.evalParm('textures') if node.parm('textures') else 'original'),
  'lava:uploadChunkMiB':(Sdf.ValueTypeNames.Int,int(node.evalParm('upload_chunk_mib')) if node.parm('upload_chunk_mib') else 16),
  'lava:mode':(Sdf.ValueTypeNames.String,node.evalParm('mode')),
+ 'lava:adaptiveSampling':(Sdf.ValueTypeNames.Bool,bool(node.evalParm('adaptive_sampling')) if node.parm('adaptive_sampling') else False),
+ 'lava:adaptiveThreshold':(Sdf.ValueTypeNames.Float,float(node.evalParm('adaptive_threshold')) if node.parm('adaptive_threshold') else .03),
+ 'lava:adaptiveMinSamples':(Sdf.ValueTypeNames.Int,int(node.evalParm('adaptive_min_samples')) if node.parm('adaptive_min_samples') else 16),
  'lava:samples':(Sdf.ValueTypeNames.Int,node.evalParm('samples')),
  'lava:exposure':(Sdf.ValueTypeNames.Float,node.evalParm('exposure')),
  'lava:headlight':(Sdf.ValueTypeNames.Bool,bool(node.evalParm('headlight'))),
@@ -30,6 +33,35 @@ settings.CreateResolutionAttr().Set(Gf.Vec2i(*resolution))
 settings.CreatePixelAspectRatioAttr().Set(1.)
 for name,(kind,value) in values.items():
  settings.GetPrim().CreateAttribute(name,kind,custom=True).Set(value)
+# AOVs are requested through standard USD RenderVars, not an integrator toggle.
+product_path=Sdf.Path(path).AppendChild('LavaDiagnostics')
+var_path=Sdf.Path(path).AppendChild('SampleCount')
+beauty_path=Sdf.Path(path).AppendChild('DiagnosticBeauty')
+targets=[p for p in settings.GetProductsRel().GetForwardedTargets() if p != product_path]
+enabled=bool(node.evalParm('sample_count_aov')) if node.parm('sample_count_aov') else False
+if enabled:
+ var=UsdRender.Var.Define(stage,var_path)
+ var.GetPrim().SetActive(True)
+ var.CreateDataTypeAttr().Set('color4f')
+ var.CreateSourceTypeAttr().Set('raw')
+ var.CreateSourceNameAttr().Set('sampleCount')
+ var.GetPrim().CreateAttribute('driver:parameters:aov:name',Sdf.ValueTypeNames.String,custom=True).Set('sampleCount')
+ beauty=UsdRender.Var.Define(stage,beauty_path)
+ beauty.GetPrim().SetActive(True)
+ beauty.CreateDataTypeAttr().Set('color4f')
+ beauty.CreateSourceTypeAttr().Set('raw')
+ beauty.CreateSourceNameAttr().Set('color')
+ beauty.GetPrim().CreateAttribute('driver:parameters:aov:name',Sdf.ValueTypeNames.String,custom=True).Set('color')
+ product=UsdRender.Product.Define(stage,product_path)
+ product.GetPrim().SetActive(True)
+ product.CreateProductNameAttr().Set('lava_diagnostics.exr')
+ product.CreateOrderedVarsRel().SetTargets([beauty_path,var_path])
+ targets.append(product_path)
+else:
+ for p in (product_path,var_path,beauty_path):
+  prim=stage.GetPrimAtPath(p)
+  if prim:prim.SetActive(False)
+settings.CreateProductsRel().SetTargets(targets)
 '''
 def build(args):
     source_digest=hashlib.sha256(args.input.read_bytes()).hexdigest()
